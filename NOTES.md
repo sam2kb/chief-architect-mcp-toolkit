@@ -48,9 +48,12 @@ server, which needs a Google API key and is not registered by default.
    (`#FFFF00`) → OK → OK.
 4. **Verify geometry without screenshots** — re-read `discover_all_objects` or
    `discover_rooms` and compare numbers.
-5. **Verify a dialog value without screenshots** — reopen the dialog, read the
+5. **Change a property across many objects** — `find` the set, `fields` to read a
+   field id off one member, then `apply` with `--apply`. One dialog per object:
+   the multi-object dialog edits only the object you double-clicked.
+6. **Verify a dialog value without screenshots** — reopen the dialog, read the
    field, then Cancel.
-6. **Read annotation text** — export the view to PDF and extract with `pypdf`.
+7. **Read annotation text** — export the view to PDF and extract with `pypdf`.
    Complete but noisy: some styles come out letter-spaced, and dimensions
    interleave with notes.
 

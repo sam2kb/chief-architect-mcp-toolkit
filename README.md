@@ -47,6 +47,13 @@ Deleting is refused over MCP. `park_objects` moves objects by a fixed offset and
 records their original position in a manifest; `unpark_objects` puts them back.
 It only moves things when you pass `apply=True`.
 
+Bulk edits come in three steps. `match_objects` filters the front view by name,
+layer or floor. `describe_fields` lists one object's dialog fields without
+changing them, which is where you find a field id. `apply_property` writes one
+field across every match, planning first and writing only when you pass
+`apply=True`. Each object gets its own dialog, so count on about a second per
+object.
+
 `call()` follows `reportFilename` automatically, so
 `await chief_mcp.objects(s)` returns the list rather than a path.
 
@@ -103,6 +110,9 @@ python chief_mcp.py objects --name Kitchen
 python chief_mcp.py objects --entire
 python chief_mcp.py audit
 python chief_mcp.py metrics
+python chief_mcp.py find --name "hinged door"
+python chief_mcp.py fields <object-id>
+python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 80" --apply
 python chief_mcp.py views
 python chief_mcp.py docs "layer sets"
 python chief_mcp.py image out.png

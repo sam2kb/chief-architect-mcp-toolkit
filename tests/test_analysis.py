@@ -92,6 +92,39 @@ class CandidatePointTests(unittest.TestCase):
         self.assertFalse(chief_mcp.contains(chief_mcp.bbox(blocker), x, y))
 
 
+class MatchObjectsTests(unittest.TestCase):
+    objects = [
+        make_object("Wall", 0, 0, 10, 1, layer="Walls,  Normal", oid="w1"),
+        make_object("Hinged Door", 1, 1, 3, 1, layer="Doors", oid="d1"),
+        make_object("Text", 2, 2, 1, 1, layer="Text", oid="t1"),
+    ]
+
+    def ids(self, **kwargs):
+        return [o["objectId"] for o in chief_mcp.match_objects(self.objects, **kwargs)]
+
+    def test_name_substring_ignores_case(self):
+        self.assertEqual(self.ids(name="door"), ["d1"])
+
+    def test_layer_substring(self):
+        self.assertEqual(self.ids(layer="walls"), ["w1"])
+
+    def test_exact_requires_whole_string(self):
+        self.assertEqual(self.ids(name="wal", exact=True), [])
+        self.assertEqual(self.ids(name="Wall", exact=True), ["w1"])
+
+    def test_no_filter_returns_everything(self):
+        self.assertEqual(len(self.ids()), 3)
+
+    def test_filters_combine(self):
+        self.assertEqual(self.ids(name="Wall", layer="doors"), [])
+
+    def test_floor_filter_excludes_unset(self):
+        upper = make_object("Light", 0, 0, 1, 1, oid="l2")
+        upper["floor"] = 2
+        pool = self.objects + [upper]
+        self.assertEqual([o["objectId"] for o in chief_mcp.match_objects(pool, name="light", floor=2)], ["l2"])
+
+
 class PayloadMergeTests(unittest.TestCase):
     def test_report_is_merged_into_the_live_payload(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:

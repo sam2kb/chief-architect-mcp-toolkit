@@ -565,6 +565,114 @@ async def audit(session):
 
 
 # --------------------------------------------------------------------------
+# bulk selection and property application
+# --------------------------------------------------------------------------
+def match_objects(objects_list, name=None, layer=None, floor=None, exact=False):
+    """Filter objects by name, layer, or floor.
+
+    Matching is a case-insensitive substring unless ``exact`` is set, so
+    ``name="wall"`` finds "Wall" while ``name="exterior"`` will not, because
+    wall type lives in the specification rather than the object name.
+    """
+
+    def hit(value, needle):
+        if needle is None:
+            return True
+        value = value or ""
+        return value == needle if exact else needle.lower() in value.lower()
+
+    return [
+        o for o in objects_list
+        if hit(o.get("name"), name)
+        and hit(o.get("layer"), layer)
+        and (floor is None or o.get("floor") == floor)
+    ]
+
+
+async def describe_fields(session, object_id, objects_list=None, panel=None):
+    """Open one object's dialog, list its writable fields, then cancel."""
+    objs = objects_list if objects_list is not None else await objects(session)
+    target = next((o for o in objs if o["objectId"] == object_id), None)
+    if target is None:
+        raise ValueError("that object is not in the front view")
+
+    dialog = await open_spec(session, bbox(target), objs, skip_ids=[object_id])
+    question = dialog.get("questionId")
+    try:
+        found = await dialog_fields(session, panel=panel)
+        panel_data = found.get("panel") or {}
+        fields = [
+            {
+                "id": node.get("id"),
+                "label": node.get("label"),
+                "value": node.get("value"),
+                "support": node.get("support"),
+            }
+            for node in (panel_data.get("nodes") or [])
+            if node.get("kind") == "field"
+        ]
+        return {"title": dialog.get("title"), "panel": panel_data.get("title"), "fields": fields}
+    finally:
+        await _cancel(session, question)
+
+
+async def apply_property(session, targets, field_id, value=None, option=None, panel=None,
+                         apply=False, limit=None, on_error="stop"):
+    """Write one dialog field on every target object.
+
+    A multi-object dialog edits only the object you double-clicked, so the only
+    way to change many objects is one dialog each. Returns a per-object report;
+    nothing is written until ``apply`` is true.
+    """
+    objects_list = await objects(session)
+    chosen = list(targets)
+    if limit:
+        chosen = chosen[:limit]
+
+    results = []
+    for obj in chosen:
+        entry = {"objectId": obj["objectId"], "name": obj.get("name")}
+        if not apply:
+            results.append({**entry, "planned": True})
+            continue
+
+        try:
+            dialog = await open_spec(session, bbox(obj), objects_list,
+                                     skip_ids=[obj["objectId"]])
+        except RuntimeError as exc:
+            results.append({**entry, "error": str(exc)})
+            if on_error == "stop":
+                break
+            continue
+
+        question = dialog.get("questionId")
+        try:
+            if panel:
+                await dialog_fields(session, panel=panel)
+            written = await set_field(session, field_id, value=value,
+                                      option=option, question=question)
+            if not written.get("written"):
+                raise RuntimeError(written.get("refusal") or "field was refused")
+            await press(session, "0", "OK", question)
+            results.append({**entry, "ok": True, "after": written.get("after")})
+        except Exception as exc:  # noqa: BLE001
+            await _cancel(session, question)
+            results.append({**entry, "error": str(exc)})
+            if on_error == "stop":
+                break
+
+    return {"applied": apply, "count": len(chosen), "results": results}
+
+
+async def _cancel(session, question):
+    """Cancel a dialog, tolerating one that already closed."""
+    try:
+        await press(session, "1", "Cancel", question)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------
 # parking -- the documented workaround for delete being refused
 # --------------------------------------------------------------------------
 PARK_OFFSET = (0.0, 5000.0)
@@ -696,6 +804,32 @@ async def _main(args):
                       f"area={row.get('standard_area')}  "
                       f"interior={row.get('interior_area')}  "
                       f"perimeter={row.get('perimeter')}")
+        elif args.cmd == "find":
+            hits = match_objects(await objects(s), name=args.name, layer=args.layer,
+                                 floor=args.floor, exact=args.exact)
+            for obj in hits:
+                print(f"{obj['objectId']}  {obj['name']:<20} layer={obj['layer']}")
+            print(f"-- {len(hits)} match(es)")
+        elif args.cmd == "fields":
+            info = await describe_fields(s, args.object_id, panel=args.panel)
+            print(f"{info['title']} / {info['panel']}")
+            for field in info["fields"]:
+                print(f"  {str(field['id']):<34} {str(field['value'])[:38]:<40} {field['support']}")
+        elif args.cmd == "apply":
+            targets = match_objects(await objects(s), name=args.name, layer=args.layer,
+                                    floor=args.floor, exact=args.exact)
+            if not targets:
+                print("nothing matched")
+                return
+            report = await apply_property(s, targets, args.field, value=args.value,
+                                          option=args.option, panel=args.panel,
+                                          apply=args.apply, limit=args.limit)
+            done = sum(1 for r in report["results"] if r.get("ok") or r.get("planned"))
+            state = "applied" if report["applied"] else "planned"
+            print(f"{state}: {done}/{report['count']}")
+            for result in report["results"]:
+                if result.get("error"):
+                    print(f"  ERROR {result.get('name')}: {result['error']}")
         elif args.cmd == "views":
             for v in await views(s):
                 front = "*" if v.get("front") else " "
@@ -722,6 +856,25 @@ def main(argv=None):
     sub.add_parser("selection", help="current selection")
     sub.add_parser("audit", help="read-only checks on the front view")
     sub.add_parser("metrics", help="room areas and perimeters, read from each dialog")
+    find = sub.add_parser("find", help="list objects matching name, layer, or floor")
+    find.add_argument("--name")
+    find.add_argument("--layer")
+    find.add_argument("--floor", type=int)
+    find.add_argument("--exact", action="store_true", help="whole-string match")
+    inspect = sub.add_parser("fields", help="list an object's dialog fields, read-only")
+    inspect.add_argument("object_id")
+    inspect.add_argument("--panel")
+    bulk = sub.add_parser("apply", help="write one dialog field on many matching objects")
+    bulk.add_argument("--name")
+    bulk.add_argument("--layer")
+    bulk.add_argument("--floor", type=int)
+    bulk.add_argument("--exact", action="store_true")
+    bulk.add_argument("--field", required=True, help="field id, as shown by `fields`")
+    bulk.add_argument("--value")
+    bulk.add_argument("--option", type=int, help="option id for a combo field")
+    bulk.add_argument("--panel")
+    bulk.add_argument("--limit", type=int)
+    bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     sub.add_parser("views", help="open views")
     doc = sub.add_parser("docs", help="search Chief's help")
     doc.add_argument("query")
