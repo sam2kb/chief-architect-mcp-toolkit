@@ -16,6 +16,7 @@ This toolkit papers over that, and records what actually works.
 | File | Purpose |
 |---|---|
 | `chief_mcp.py` | Async helpers + CLI over the MCP tools |
+| `instruction-set.md` | Guardrails to paste into an agent's rules file |
 | `selftest.py` | Read-only smoke test: connect, list views/rooms, pick a hit point |
 | `NOTES.md` | Field notes: capability matrix, working recipes, pitfalls |
 | `privacy_check.py` | Fails if personal or secret-looking data reaches tracked files |
@@ -36,6 +37,15 @@ Geometry: `bbox`, `left`, `width`, `contains`, `free_point`, `fmt_inches`,
 Recipes, each of which opens a Specification dialog, writes the value, and
 confirms it: `open_spec`, `move_object`, `rename_room`, `set_text_fill`.
 These exist because the dialogs are the only edit path that reliably commits.
+
+Reading the model: `audit` checks the front view for unnamed rooms, zero-size
+objects, text on the wrong layer, locked layers, and exact duplicates.
+`room_metrics` opens each room, reads the areas and perimeter Chief computes,
+and cancels the dialog without changing anything.
+
+Deleting is refused over MCP. `park_objects` moves objects by a fixed offset and
+records their original position in a manifest; `unpark_objects` puts them back.
+It only moves things when you pass `apply=True`.
 
 `call()` follows `reportFilename` automatically, so
 `await chief_mcp.objects(s)` returns the list rather than a path.
@@ -91,6 +101,8 @@ server directly. Otherwise they read the matching entry out of your VS Code
 python chief_mcp.py rooms
 python chief_mcp.py objects --name Kitchen
 python chief_mcp.py objects --entire
+python chief_mcp.py audit
+python chief_mcp.py metrics
 python chief_mcp.py views
 python chief_mcp.py docs "layer sets"
 python chief_mcp.py image out.png
@@ -108,13 +120,19 @@ async with chief_mcp.client() as s:
 
 ## Before you trust it
 
-Read `NOTES.md`. The short version:
+Read `NOTES.md` for the detail. What works and what does not:
 
-- Reads and dialog field writes are dependable.
-- Synthetic drags do not commit — positions never change.
-- Text object contents are not exposed anywhere.
-- With Project Management off, `invoke_command`, `input_hotkey`,
-  `open_document` and the project browser are refused.
+| Without Project Management | Result |
+|---|---|
+| Reading objects, rooms, properties, selection, views | works |
+| Reading values out of a Specification dialog | works, if you cancel afterwards |
+| Writing a field and pressing OK | works |
+| Selecting objects by id | works |
+| Exporting PDF, image, DWG | works |
+| Synthetic drags | do not commit; positions never change |
+| Text object contents | not exposed anywhere |
+| `invoke_command`, `input_hotkey`, `open_document`, project browser | refused |
+| Delete, by any route | refused by design |
 
 ## Tests
 

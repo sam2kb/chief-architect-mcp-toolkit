@@ -3,6 +3,10 @@
 Measured against Chief Architect Premier X18, build 28.2.1.14, with
 **Project Management disabled** and files kept outside Chief's managed store.
 
+Chief staff have said the tool set is incomplete in the initial release and that
+more tools are coming. Retest the refusals after each X18 update rather than
+treating them as permanent.
+
 ## Wiring
 
 | Piece | Value |
@@ -28,7 +32,7 @@ server, which needs a Google API key and is not registered by default.
 | Search bundled help docs | works |
 | Pointer click, double-click, scroll | works |
 | Drag to move an object | **no-op** |
-| `invoke_command`, `input_hotkey`, `open_document`, project browser | refused: needs project management mode |
+| `invoke_command`, `input_hotkey`, `open_document`, project browser | refused: needs project management mode (this build) |
 | Layout page navigation | unavailable (the relevant command is gated) |
 | Read text object contents | impossible |
 
@@ -52,6 +56,16 @@ server, which needs a Google API key and is not registered by default.
 
 ## Pitfalls
 
+- **Delete is refused on purpose.** Rebinding it to a fresh hotkey does not help;
+  the server recognises the action. Park objects at a fixed offset and record
+  their original positions so they can be restored.
+- **`invoke_command` cannot be undone.** Work on a copy of the plan before letting
+  an agent edit anything.
+- **Resetting a room label deletes the macro inside it.** Agents do this while
+  tidying; the label has to be restored by name, not by undo alone.
+- **Long option lists move into a report file.** Merge `reportFilename` into the
+  payload instead of replacing it. Replacing it drops `panel`, and with it every
+  dialog field, which looks exactly like a dialog that answered nothing.
 - **Drags never commit.** A single `drag`, a long `drag`, and
   press → move → move → release all reported success while every position
   stayed identical. Clicks hit-test correctly, so it is drag-move specifically
@@ -81,6 +95,9 @@ server, which needs a Google API key and is not registered by default.
 Preferences → Project Management → *Use Chief Architect Project Management*.
 Every plan and layout must be closed to switch. It relocates files into a
 hidden managed store with hashed names and warns against placing that store on
-a synced or network location — worth checking against how you store project
-files before flipping it. Enabling it unlocks commands, hotkeys, document
-opening, and the project browser.
+a synced or network location, so check how you store project files first.
+Enabling it unlocks commands, hotkeys, document opening, and the project browser.
+
+Whether the dependency is architectural is still open. The staff reply in the
+forum thread addressed missing tools in the initial release rather than saying
+Project Management is technically required.

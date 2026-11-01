@@ -97,18 +97,34 @@ def _text(result) -> str:
 
 
 def _payload(result):
-    """Parse a tool result, transparently following reportFilename."""
+    """Parse a tool result, merging in any report file it refers to.
+
+    Some tools answer with a short payload plus a ``reportFilename`` holding the
+    bulky part (object lists, long option lists). The report is merged under the
+    live payload rather than replacing it, so keys like ``panel`` survive.
+    """
     text = _text(result)
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return text
-    if isinstance(data, dict):
-        report = data.get("reportFilename")
-        if report and os.path.isfile(report):
-            with open(report, encoding="utf-8") as fh:
-                return json.load(fh)
-    return data
+    if not isinstance(data, dict):
+        return data
+
+    report = data.get("reportFilename")
+    if not report or not os.path.isfile(report):
+        return data
+    try:
+        with open(report, encoding="utf-8") as fh:
+            from_file = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return data
+    if not isinstance(from_file, dict):
+        return from_file
+
+    merged = dict(from_file)
+    merged.update(data)
+    return merged
 
 
 async def call(session: ClientSession, tool: str, **arguments):
@@ -339,13 +355,48 @@ def parse_inches(text: str) -> float:
 # --------------------------------------------------------------------------
 # recipes -- the edit paths that actually commit
 # --------------------------------------------------------------------------
-async def open_spec(session, bounds, objects, skip_ids=()):
-    """Double-click a safe point inside ``bounds`` and return the dialog payload."""
-    x, y = free_point(bounds, objects, skip_ids=skip_ids)
-    dialog = await dblclick(session, x, y)
-    if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
-        raise RuntimeError(f"no dialog was raised at ({x:.2f}, {y:.2f})")
-    return dialog
+def _candidate_points(bounds, objects, skip_ids=(), attempts=4):
+    """Ordered double-click targets: the free point first, then fallbacks."""
+    points = [free_point(bounds, objects, skip_ids=skip_ids)]
+    points.append(((bounds["minX"] + bounds["maxX"]) / 2,
+                   (bounds["minY"] + bounds["maxY"]) / 2))
+    for fx, fy in ((0.25, 0.25), (0.75, 0.75), (0.25, 0.75), (0.75, 0.25)):
+        points.append((
+            bounds["minX"] + (bounds["maxX"] - bounds["minX"]) * fx,
+            bounds["minY"] + (bounds["maxY"] - bounds["minY"]) * fy,
+        ))
+    seen = set()
+    ordered = []
+    for x, y in points:
+        key = (round(x, 3), round(y, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append((x, y))
+    return ordered[:attempts]
+
+
+async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts=4):
+    """Double-click until a dialog opens, and return its payload.
+
+    The first click can land on a dimension line running across the object, so
+    later attempts try other points inside the bounds. When ``expect`` is given,
+    a dialog whose title does not contain it is cancelled and the next point is
+    tried.
+    """
+    wrong = None
+    for x, y in _candidate_points(bounds, objects, skip_ids, attempts):
+        dialog = await dblclick(session, x, y)
+        if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
+            continue
+        title = dialog.get("title") or ""
+        if expect and expect.lower() not in title.lower():
+            await press(session, "1", "Cancel", dialog.get("questionId"))
+            wrong = title
+            continue
+        return dialog
+    suffix = f" (last dialog opened was {wrong!r})" if wrong else ""
+    raise RuntimeError(f"no matching dialog opened inside those bounds{suffix}")
 
 
 async def move_object(session, bounds, objects, dx=0.0, dy=0.0, skip_ids=()):
@@ -356,7 +407,7 @@ async def move_object(session, bounds, objects, dx=0.0, dy=0.0, skip_ids=()):
     """
     dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
     question = dialog.get("questionId")
-    fields = await dialog_fields(session)
+    fields = await dialog_fields(session, panel="General")
     x_node = find_node(fields, "boxID_XPos")
     y_node = find_node(fields, "boxID_YPos")
     if x_node is None or y_node is None:
@@ -399,6 +450,207 @@ async def set_text_fill(session, bounds, objects, hex_color, skip_ids=()):
 
 
 # --------------------------------------------------------------------------
+# read-only analysis
+# --------------------------------------------------------------------------
+ROOM_FIELDS = {
+    "roomID_RoomName": "name",
+    "roomID_Dimensions": "dimensions",
+    "roomID_Perimeter": "perimeter",
+    "roomID_StandardArea": "standard_area",
+    "roomID_InteriorArea": "interior_area",
+    "roomID_Volume": "volume",
+}
+
+
+async def room_metrics(session, rooms_list=None, limit=None):
+    """Read each room's areas and perimeter from its dialog, then cancel.
+
+    Chief reports these on the General panel, so they are the app's own
+    figures rather than a bounding-box estimate. The dialog is only read: every
+    room is cancelled, never confirmed.
+    """
+    objs = await objects(session)
+    targets = rooms_list if rooms_list is not None else await rooms(session)
+    if limit:
+        targets = targets[:limit]
+
+    rows = []
+    for room in targets:
+        bounds = room.get("boundingBox")
+        if not bounds:
+            continue
+        try:
+            dialog = await open_spec(session, bounds, objs,
+                                     skip_ids=[room.get("objectId")], expect="Room")
+        except RuntimeError as exc:
+            rows.append({"name": room.get("roomName"), "error": str(exc)})
+            continue
+
+        question = dialog.get("questionId")
+        fields = await dialog_fields(session, panel="General")
+        row = {"name": room.get("roomName"), "type": room.get("roomType")}
+        for node_id, key in ROOM_FIELDS.items():
+            row[key] = node_value(fields, node_id)
+        await press(session, "1", "Cancel", question)
+        rows.append(row)
+    return rows
+
+
+def audit_findings(objects_list, rooms_list):
+    """Checks that only read the model. Returns [{rule, detail, objects}]."""
+    findings = []
+
+    unnamed = [r for r in rooms_list if not (r.get("roomName") or "").strip()]
+    if unnamed:
+        findings.append({
+            "rule": "unnamed-room",
+            "detail": f"{len(unnamed)} room(s) have no name",
+            "objects": [r.get("objectId") for r in unnamed],
+        })
+
+    unbounded = [r for r in rooms_list if not r.get("boundingBox")]
+    if unbounded:
+        findings.append({
+            "rule": "room-without-bounds",
+            "detail": f"{len(unbounded)} room(s) report no bounding box",
+            "objects": [r.get("objectId") for r in unbounded],
+        })
+
+    degenerate = [o for o in objects_list
+                  if o["size"]["width"] <= 0 or o["size"]["depth"] <= 0]
+    if degenerate:
+        findings.append({
+            "rule": "zero-size-object",
+            "detail": f"{len(degenerate)} object(s) have zero width or depth",
+            "objects": [o["objectId"] for o in degenerate],
+        })
+
+    misfiled = [o for o in objects_list
+                if o["name"] in ("Text", "Rich Text") and "text" not in o["layer"].lower()]
+    if misfiled:
+        findings.append({
+            "rule": "text-off-text-layer",
+            "detail": f"{len(misfiled)} text object(s) sit on a layer without 'text' in its name",
+            "objects": [o["objectId"] for o in misfiled],
+        })
+
+    locked = [o for o in objects_list if o.get("layerLocked")]
+    if locked:
+        findings.append({
+            "rule": "locked-layer-object",
+            "detail": f"{len(locked)} object(s) are on locked layers",
+            "objects": [o["objectId"] for o in locked],
+        })
+
+    buckets = {}
+    for o in objects_list:
+        key = (o["name"],
+               round(o["location"]["x"], 3), round(o["location"]["y"], 3),
+               round(o["size"]["width"], 3), round(o["size"]["depth"], 3))
+        buckets.setdefault(key, []).append(o["objectId"])
+    duplicates = {k: v for k, v in buckets.items() if len(v) > 1}
+    if duplicates:
+        findings.append({
+            "rule": "exact-duplicate",
+            "detail": f"{len(duplicates)} position(s) hold objects that match exactly",
+            "objects": [oid for ids in duplicates.values() for oid in ids],
+        })
+
+    return findings
+
+
+async def audit(session):
+    """Run the read-only checks against the front view."""
+    return audit_findings(await objects(session), await rooms(session))
+
+
+# --------------------------------------------------------------------------
+# parking -- the documented workaround for delete being refused
+# --------------------------------------------------------------------------
+PARK_OFFSET = (0.0, 5000.0)
+PARK_MANIFEST = Path(os.environ.get(
+    "CAMCP_PARK_MANIFEST", str(Path.home() / ".chief_mcp_parked.json")
+))
+
+
+def _read_manifest() -> dict:
+    if not PARK_MANIFEST.is_file():
+        return {}
+    try:
+        return json.loads(PARK_MANIFEST.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_manifest(data: dict) -> None:
+    PARK_MANIFEST.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+
+async def park_objects(session, object_ids, apply=False, offset=PARK_OFFSET):
+    """Move objects out of the way, since delete is refused over MCP.
+
+    Returns the plan and moves nothing unless ``apply`` is true. Each parked id
+    is written to a manifest with its original position, so ``unpark_objects``
+    can put it back.
+    """
+    objs = await objects(session)
+    index = {o["objectId"]: o for o in objs}
+    dx, dy = offset
+
+    plan = []
+    for oid in object_ids:
+        obj = index.get(oid)
+        if obj is None:
+            plan.append({"objectId": oid, "error": "not in the front view"})
+            continue
+        plan.append({
+            "objectId": oid,
+            "name": obj["name"],
+            "from": {"x": obj["location"]["x"], "y": obj["location"]["y"]},
+            "to": {"x": obj["location"]["x"] + dx, "y": obj["location"]["y"] + dy},
+        })
+
+    if not apply:
+        return {"applied": False, "plan": plan}
+
+    manifest = _read_manifest()
+    done = []
+    for entry in plan:
+        if "error" in entry:
+            continue
+        obj = index[entry["objectId"]]
+        await move_object(session, bbox(obj), objs, dx=dx, dy=dy,
+                          skip_ids=[entry["objectId"]])
+        manifest[entry["objectId"]] = entry["from"]
+        done.append(entry["objectId"])
+    _write_manifest(manifest)
+    return {"applied": True, "moved": done, "manifest": str(PARK_MANIFEST)}
+
+
+async def unpark_objects(session, object_ids=None):
+    """Move parked objects back to where the manifest says they came from."""
+    manifest = _read_manifest()
+    targets = list(manifest) if object_ids is None else list(object_ids)
+    objs = await objects(session)
+    index = {o["objectId"]: o for o in objs}
+
+    restored = []
+    for oid in targets:
+        home = manifest.get(oid)
+        obj = index.get(oid)
+        if not home or obj is None:
+            continue
+        await move_object(session, bbox(obj), objs,
+                          dx=home["x"] - obj["location"]["x"],
+                          dy=home["y"] - obj["location"]["y"],
+                          skip_ids=[oid])
+        manifest.pop(oid, None)
+        restored.append(oid)
+    _write_manifest(manifest)
+    return restored
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def _print_rooms(rs):
@@ -428,6 +680,22 @@ async def _main(args):
             _print_objects(await objects(s, entire=args.entire), args.name)
         elif args.cmd == "selection":
             _print_objects(await selection(s))
+        elif args.cmd == "audit":
+            findings = await audit(s)
+            if not findings:
+                print("clean: no findings")
+            for finding in findings:
+                print(f"{finding['rule']:<22} {finding['detail']}")
+        elif args.cmd == "metrics":
+            for row in await room_metrics(s):
+                label = row.get("name") or "(unnamed)"
+                if "error" in row:
+                    print(f"{label:<24} ERROR {row['error']}")
+                    continue
+                print(f"{label:<24} {row.get('dimensions')}  "
+                      f"area={row.get('standard_area')}  "
+                      f"interior={row.get('interior_area')}  "
+                      f"perimeter={row.get('perimeter')}")
         elif args.cmd == "views":
             for v in await views(s):
                 front = "*" if v.get("front") else " "
@@ -452,6 +720,8 @@ def main(argv=None):
     objs.add_argument("--entire", action="store_true", help="whole document")
     objs.add_argument("--name", help="filter by object name or layer substring")
     sub.add_parser("selection", help="current selection")
+    sub.add_parser("audit", help="read-only checks on the front view")
+    sub.add_parser("metrics", help="room areas and perimeters, read from each dialog")
     sub.add_parser("views", help="open views")
     doc = sub.add_parser("docs", help="search Chief's help")
     doc.add_argument("query")
