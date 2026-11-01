@@ -1,4 +1,4 @@
-"""camcp.py -- helper layer over Chief Architect's bundled ``ca-mcp-x18`` MCP server.
+"""chief_mcp.py -- helper layer over Chief Architect's bundled ``ca-mcp-x18`` MCP server.
 
 Why this exists: every ``chief_discover_*`` MCP tool writes its payload to a
 temp JSON report and returns only the filename. These helpers call the tool,
@@ -8,15 +8,15 @@ Requires a Python environment with the ``mcp`` package (the same one the MCP
 server itself runs under).
 
 CLI:
-    python camcp.py rooms
-    python camcp.py objects --name Kitchen
-    python camcp.py views
+    python chief_mcp.py rooms
+    python chief_mcp.py objects --name Kitchen
+    python chief_mcp.py views
 
 Library:
-    import camcp
-    async with camcp.client() as s:
-        rooms = await camcp.rooms(s)
-        await camcp.select(s, [r["objectId"] for r in rooms])
+    import chief_mcp
+    async with chief_mcp.client() as s:
+        rooms = await chief_mcp.rooms(s)
+        await chief_mcp.select(s, [r["objectId"] for r in rooms])
 """
 
 from __future__ import annotations
@@ -51,7 +51,10 @@ def load_env(path: Path | None = None) -> None:
             continue
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
-Launch params: explicit CAMCP_PYTHON/CAMCP_CHIEF_SRC from .env, else mcp.json."""
+
+
+def server_params() -> StdioServerParameters:
+    """Launch params: explicit CAMCP_PYTHON/CAMCP_CHIEF_SRC from .env, else mcp.json."""
     python = os.environ.get("CAMCP_PYTHON")
     chief_src = os.environ.get("CAMCP_CHIEF_SRC")
     if python and chief_src:
@@ -79,17 +82,6 @@ def mcp_config_path() -> Path:
     if appdata:
         return Path(appdata) / "Code" / "User" / "mcp.json"
     return Path.home() / ".config" / "Code" / "User" / "mcp.json"
-
-
-def server_params() -> StdioServerParameters:
-    """Build launch params from the live VS Code mcp.json entry."""
-    with open(mcp_config_path(), encoding="utf-8") as fh:
-        entry = json.load(fh)["servers"][SERVER_NAME]
-    env = dict(os.environ)
-    env.update(entry.get("env", {}))
-    return StdioServerParameters(
-        command=entry["command"], args=entry["args"], env=env
-    )
 
 
 @asynccontextmanager
@@ -318,6 +310,92 @@ def fmt_inches(value: float, denom: int = 16) -> str:
         divisor = math.gcd(num, denom)
         text += f" {num // divisor}/{denom // divisor}"
     return text + '"'
+
+
+def parse_inches(text: str) -> float:
+    """`7 1/2"` -> 7.5, `-1 5/8"` -> -1.625, `2'-6"` -> 30.0, `120` -> 120.0."""
+    raw = str(text).strip().replace('"', "").replace("\u201d", "")
+    if not raw:
+        raise ValueError("empty length")
+    sign = -1.0 if raw.lstrip().startswith("-") else 1.0
+    raw = raw.lstrip("+-").strip()
+
+    feet = 0.0
+    if "'" in raw:
+        head, _, raw = raw.partition("'")
+        feet = float(head.strip() or 0)
+        raw = raw.strip().lstrip("-").strip()
+
+    inches = 0.0
+    for part in raw.split():
+        if "/" in part:
+            num, _, den = part.partition("/")
+            inches += float(num) / float(den)
+        elif part:
+            inches += float(part)
+    return sign * (feet * 12 + inches)
+
+
+# --------------------------------------------------------------------------
+# recipes -- the edit paths that actually commit
+# --------------------------------------------------------------------------
+async def open_spec(session, bounds, objects, skip_ids=()):
+    """Double-click a safe point inside ``bounds`` and return the dialog payload."""
+    x, y = free_point(bounds, objects, skip_ids=skip_ids)
+    dialog = await dblclick(session, x, y)
+    if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
+        raise RuntimeError(f"no dialog was raised at ({x:.2f}, {y:.2f})")
+    return dialog
+
+
+async def move_object(session, bounds, objects, dx=0.0, dy=0.0, skip_ids=()):
+    """Shift an object by (dx, dy) inches through its position fields.
+
+    Works on objects whose Specification dialog exposes ``boxID_XPos`` /
+    ``boxID_YPos`` on the General panel (CAD blocks, text, and similar).
+    """
+    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
+    question = dialog.get("questionId")
+    fields = await dialog_fields(session)
+    x_node = find_node(fields, "boxID_XPos")
+    y_node = find_node(fields, "boxID_YPos")
+    if x_node is None or y_node is None:
+        await press(session, "1", "Cancel", question)
+        raise RuntimeError("that dialog has no X/Y position fields")
+
+    if dx:
+        await set_field(session, "boxID_XPos",
+                        value=f'{parse_inches(x_node["value"]) + dx}"', question=question)
+    if dy:
+        await set_field(session, "boxID_YPos",
+                        value=f'{parse_inches(y_node["value"]) + dy}"', question=question)
+    await press(session, "0", "OK", question)
+
+
+async def rename_room(session, bounds, objects, name, skip_ids=()):
+    """Set a room's name, which is what its plan label displays."""
+    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
+    question = dialog.get("questionId")
+    fields = await dialog_fields(session, panel="General")
+    if find_node(fields, "roomID_RoomName") is None:
+        await press(session, "1", "Cancel", question)
+        raise RuntimeError("that dialog has no room name field")
+    await set_field(session, "roomID_RoomName", value=name, question=question)
+    await press(session, "0", "OK", question)
+
+
+async def set_text_fill(session, bounds, objects, hex_color, skip_ids=()):
+    """Set the fill/background of a text object, e.g. '#FFFF00' for yellow."""
+    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
+    question = dialog.get("questionId")
+    await dialog_fields(session, panel="Fill Style")
+
+    await set_field(session, "attrID_PatternColor", value=True, question=question)
+    colour = await dialog_fields(session)
+    colour_question = colour.get("questionId")
+    await set_field(session, "ColorShower_Hex", value=hex_color, question=colour_question)
+    await press(session, "0", "OK", colour_question)
+    await press(session, "0", "OK", question)
 
 
 # --------------------------------------------------------------------------

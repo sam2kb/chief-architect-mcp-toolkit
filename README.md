@@ -15,7 +15,7 @@ This toolkit papers over that, and records what actually works.
 
 | File | Purpose |
 |---|---|
-| `camcp.py` | Async helpers + CLI over the MCP tools |
+| `chief_mcp.py` | Async helpers + CLI over the MCP tools |
 | `selftest.py` | Read-only smoke test: connect, list views/rooms, pick a hit point |
 | `NOTES.md` | Field notes: capability matrix, working recipes, pitfalls |
 | `privacy_check.py` | Fails if personal or secret-looking data reaches tracked files |
@@ -30,10 +30,18 @@ Input: `select`, `click`, `dblclick`, `export_image`, `export_pdf`.
 Dialogs (the reliable way to edit anything): `dialog_fields`, `find_node`,
 `node_value`, `set_field`, `press`.
 
-Geometry: `bbox`, `left`, `width`, `contains`, `free_point`, `fmt_inches`.
+Geometry: `bbox`, `left`, `width`, `contains`, `free_point`, `fmt_inches`,
+`parse_inches`.
+
+Recipes, each of which opens a Specification dialog, writes the value, and
+confirms it: `open_spec`, `move_object`, `rename_room`, `set_text_fill`.
+These exist because the dialogs are the only edit path that reliably commits.
 
 `call()` follows `reportFilename` automatically, so
-`await camcp.objects(s)` returns the list rather than a path.
+`await chief_mcp.objects(s)` returns the list rather than a path.
+
+Note the module is `chief_mcp`, not `camcp`: naming it `camcp` would shadow the
+`camcp` package that Chief's own server imports.
 
 ## Requirements
 
@@ -80,22 +88,22 @@ server directly. Otherwise they read the matching entry out of your VS Code
 ## Usage
 
 ```bash
-python camcp.py rooms
-python camcp.py objects --name Kitchen
-python camcp.py objects --entire
-python camcp.py views
-python camcp.py docs "layer sets"
-python camcp.py image out.png
+python chief_mcp.py rooms
+python chief_mcp.py objects --name Kitchen
+python chief_mcp.py objects --entire
+python chief_mcp.py views
+python chief_mcp.py docs "layer sets"
+python chief_mcp.py image out.png
 ```
 
 ```python
-import camcp
+import chief_mcp
 
-async with camcp.client() as s:
-    rooms = await camcp.rooms(s)
+async with chief_mcp.client() as s:
+    rooms = await chief_mcp.rooms(s)
     office = next(r for r in rooms if r["roomType"] == "Office")
-    x, y = camcp.free_point(office["boundingBox"], await camcp.objects(s))
-    await camcp.select(s, [office["objectId"]])
+    x, y = chief_mcp.free_point(office["boundingBox"], await chief_mcp.objects(s))
+    await chief_mcp.select(s, [office["objectId"]])
 ```
 
 ## Before you trust it
@@ -107,6 +115,16 @@ Read `NOTES.md`. The short version:
 - Text object contents are not exposed anywhere.
 - With Project Management off, `invoke_command`, `input_hotkey`,
   `open_document` and the project browser are refused.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+The unit tests are offline: inch formatting and parsing, bounding boxes,
+hit-point selection against overlapping obstacles, and `.env` loading. Run
+`selftest.py` for the live check -- it only reads, opening no dialogs.
 
 ## License
 

@@ -58,7 +58,7 @@ server, which needs a Google API key and is not registered by default.
   that fails.
 - **A room's reported interior point can sit under a dimension line**, so a
   double-click aimed at it opens the dimension's dialog instead. Use
-  `camcp.free_point()`.
+  `chief_mcp.free_point()`.
 - **Room-layer bounding boxes overlap**, and the exterior room spans the whole
   building. Exclude layer `Rooms` when choosing a hit point or nothing looks
   free.
