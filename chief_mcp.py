@@ -394,6 +394,24 @@ async def cycle_selection(session, point, target_id, presses: int = 12):
     return None, seen
 
 
+async def settle(session, escape: bool = True) -> dict:
+    """Leave Chief in a state where a person can just start typing.
+
+    MCP reports dialogs and selections, but not an in-place edit holding the
+    keyboard, and Chief will not give that up on its own -- the window keeps the
+    focus and the user has to go and cancel it by hand. So finish a run by
+    cancelling the dialog, sending Escape, and clearing the selection, and do the
+    same between objects in a loop.
+    """
+    state = {"cancelled": await clear_dialogs(session)}
+    state["escape"] = send_escape(steal=True) if escape else False
+    await select(session, [])
+    state["selection"] = await selection(session)
+    dialogs = await call(session, "chief_discover_open_dialogs")
+    state["dialog_open"] = bool((dialogs.get("trackedQuestion") or {}).get("active"))
+    return state
+
+
 async def recover(session, keyboard: bool = False, focus: bool = False) -> dict:
     """Get Chief back to a state that accepts gestures, without touching focus.
 
@@ -723,14 +741,22 @@ async def hit_point(session, obj, steps: int = 7, inset: float = 1.0):
     reading back the selection sidesteps that: usually one or two clicks away.
     Returns ``None`` when no point in the box selects it. Costs one click per
     point tried, so shortcut by trying a geometric point first.
+
+    A click that selects nothing usually landed on a dimension number, which
+    starts an in-place edit and leaves a caret holding the keyboard. That is
+    cancelled with Escape before moving to the next point.
     """
     for x, y in scan_points(bbox(obj), steps=steps, inset=inset):
         await select(session, [])
         reply = await click(session, x, y)
         if not isinstance(reply, dict) or not reply.get("success"):
             return None
-        if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
+        selected = [s.get("objectId") for s in await selection(session)]
+        if obj["objectId"] in selected:
             return x, y
+        if not selected:
+            send_escape(steal=True)
+            time.sleep(0.15)
     return None
 
 
@@ -741,6 +767,9 @@ async def reachable_point(session, obj, steps: int = 7, presses: int = 8):
     else takes it, Tab through the stack under the cursor, which is the same
     gesture a person uses for covered objects. Scanning the bounds is the last
     resort, since it costs a click per point.
+
+    A click that selects nothing opened something instead -- most often a
+    dimension number's in-place editor, which holds the keyboard until Escape.
     """
     bounds = bbox(obj)
     x = (bounds["minX"] + bounds["maxX"]) / 2
@@ -750,41 +779,44 @@ async def reachable_point(session, obj, steps: int = 7, presses: int = 8):
     reply = await click(session, x, y)
     if not isinstance(reply, dict) or not reply.get("success"):
         return None
-    if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
+
+    selected = [s.get("objectId") for s in await selection(session)]
+    if obj["objectId"] in selected:
         return x, y
 
-    for _ in range(presses):
-        if not send_key("Tab"):
-            break
+    if selected:
+        for _ in range(presses):
+            if not send_key("Tab"):
+                break
+            time.sleep(0.15)
+            if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
+                return x, y
+    else:
+        send_escape(steal=True)
         time.sleep(0.15)
-        if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
-            return x, y
 
     return await hit_point(session, obj, steps=steps)
 
 
 async def open_spec_anywhere(session, obj, objects, expect=None, attempts=4, steps=7):
-    """Open an object's Specification dialog, reaching it by any means.
+    """Open an object's Specification dialog on a point proven to hit the object.
 
-    The geometric point can land on a marker, a dimension line, or a room face
-    instead of the object. When it does, the click that would select the object
-    is spent finding a real point rather than reporting the object unreachable.
+    Double-clicking a guessed point is what starts an in-place edit when the guess
+    lands on a dimension number. So the point is found with single clicks first,
+    read back through the selection, and only that point is double-clicked.
     """
-    try:
-        return await open_spec(session, bbox(obj), objects, skip_ids=[obj["objectId"]],
-                               expect=expect, attempts=attempts)
-    except RuntimeError:
-        point = await reachable_point(session, obj, steps=steps)
-        if point is None:
-            raise
-        dialog = await dblclick(session, *point)
-        if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
-            raise
-        title = dialog.get("title") or ""
-        if expect and expect.lower() not in title.lower():
-            await press(session, "1", "Cancel", dialog.get("questionId"))
-            raise RuntimeError(f"selected the object but the dialog opened was {title!r}")
-        return dialog
+    point = await reachable_point(session, obj, steps=steps)
+    if point is None:
+        raise RuntimeError("no click inside those bounds selects the object")
+    dialog = await dblclick(session, *point)
+    if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
+        send_escape(steal=True)
+        raise RuntimeError("the point selects the object but opened no dialog")
+    title = dialog.get("title") or ""
+    if expect and expect.lower() not in title.lower():
+        await press(session, "1", "Cancel", dialog.get("questionId"))
+        raise RuntimeError(f"selected the object but the dialog opened was {title!r}")
+    return dialog
 
 
 @asynccontextmanager
