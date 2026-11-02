@@ -271,9 +271,31 @@ async def recover_after_timeout(session, budget: float = 1.5) -> list:
 # --------------------------------------------------------------------------
 # reads
 # --------------------------------------------------------------------------
+def _expect_list(data, key, tool):
+    """The list a tool returned, or an exception saying what went wrong instead.
+
+    A failed tool answers with its error text, and handing that back as if it were
+    a list of objects only fails later, somewhere confusing -- matching objects for
+    instance, which then reports that a string has no ``.get``. When the app is not
+    running at all, the pipe is missing and every tool fails this way.
+    """
+    if isinstance(data, dict):
+        if data.get("success") is False:
+            raise RuntimeError(f"{tool} failed: {data.get('message') or 'no message'}")
+        value = data.get(key, data)
+        if isinstance(value, list):
+            return value
+    if isinstance(data, list):
+        return data
+    if isinstance(data, str) and data.strip():
+        # the tool's own error text, which already names the tool and the cause
+        raise RuntimeError(data.strip()[:300])
+    raise RuntimeError(f"{tool} returned something unexpected: {str(data)[:200]}")
+
+
 async def objects(session, entire: bool = False):
     data = await call(session, "chief_discover_all_objects", entireDocument=entire or None)
-    return data.get("objects", data) if isinstance(data, dict) else data
+    return _expect_list(data, "objects", "chief_discover_all_objects")
 
 
 async def properties(session, object_ids, names=None):
@@ -287,17 +309,17 @@ async def properties(session, object_ids, names=None):
 
 async def rooms(session, floor=None):
     data = await call(session, "chief_discover_rooms", floor=floor)
-    return data.get("rooms", data)
+    return _expect_list(data, "rooms", "chief_discover_rooms")
 
 
 async def selection(session):
     data = await call(session, "chief_discover_selection")
-    return data.get("selectedObjects", [])
+    return _expect_list(data, "selectedObjects", "chief_discover_selection")
 
 
 async def views(session):
     data = await call(session, "chief_discover_open_views")
-    return data.get("views", [])
+    return _expect_list(data, "views", "chief_discover_open_views")
 
 
 async def commands(session):
@@ -1707,20 +1729,25 @@ async def _main(args):
             print((await export_image(s, args.path)).get("message"))
 
 
-def find_timeout(exc):
-    """The CallTimeout inside an exception, including one wrapped by anyio.
+def find_exception(exc, kind):
+    """The first exception of ``kind`` inside ``exc``, including nested groups.
 
     The stdio client runs in a task group, so anything raised inside the session
     arrives wrapped in an ExceptionGroup. The cause is still worth reporting
     plainly instead of as a traceback.
     """
-    if isinstance(exc, CallTimeout):
+    if isinstance(exc, kind):
         return exc
     for nested in getattr(exc, "exceptions", ()) or ():
-        found = find_timeout(nested)
+        found = find_exception(nested, kind)
         if found is not None:
             return found
     return None
+
+
+def find_timeout(exc):
+    """The CallTimeout inside an exception, if there is one."""
+    return find_exception(exc, CallTimeout)
 
 
 def main(argv=None):
@@ -1802,12 +1829,16 @@ def main(argv=None):
         return 130
     except BaseException as exc:  # noqa: BLE001
         timeout = find_timeout(exc)
-        if timeout is None:
-            raise
-        print(f"aborted: {timeout}", file=sys.stderr)
-        print("the session may already be wedged; run `chief_mcp.py settle` or restart Chief",
-              file=sys.stderr)
-        return 2
+        if timeout is not None:
+            print(f"aborted: {timeout}", file=sys.stderr)
+            print("the session may already be wedged; run `chief_mcp.py settle` or restart Chief",
+                  file=sys.stderr)
+            return 2
+        error = find_exception(exc, RuntimeError)
+        if error is not None:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        raise
     return 0
 
 
