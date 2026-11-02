@@ -126,8 +126,12 @@ Bulk edits come in three steps. `match_objects` filters the front view by name,
 layer or floor. `describe_fields` lists one object's dialog fields without
 changing them, which is where you find a field id. `apply_property` writes one
 field across every match, planning first and writing only when you pass
-`apply=True`. Each object gets its own dialog, so count on about a second per
-object.
+`apply=True`, and printing the value each dialog reported afterwards. Each object
+gets its own dialog, so count on about a second per object. A failed object is
+retried once after settling, since most failures are a stale modal rather than
+the object; `--on-error continue` keeps the rest of the batch going, and
+`--selected` takes the targets from the current selection when an object cannot
+be matched by name or reached by clicking.
 
 Before a long run, `snapshot` writes the objects, rooms and front view to JSON.
 `diff` compares a saved snapshot against the current state and reports what
@@ -200,6 +204,7 @@ python chief_mcp.py find --name "hinged door"
 python chief_mcp.py fields <object-id>
 python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 80" --expect Door
 python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 84" --expect Door --apply
+python chief_mcp.py apply --selected --field roomID_CeilingElevation --value '120"' --panel Structure --expect Room --apply
 python chief_mcp.py snapshot
 python chief_mcp.py diff ~/.chief_mcp/snap-2026-11-01T190949.json
 python chief_mcp.py clear          # cancel a stranded dialog

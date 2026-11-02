@@ -60,7 +60,12 @@ server, which needs a Google API key and is not registered by default.
    `discover_rooms` and compare numbers.
 5. **Change a property across many objects** — `find` the set, `fields` to read a
    field id off one member, then `apply` with `--apply`. One dialog per object:
-   the multi-object dialog edits only the object you double-clicked.
+   the multi-object dialog edits only the object you double-clicked. Add
+   `--expect` so a click that opens a neighbour's dialog is rejected, and
+   `--on-error continue` so one object cannot abandon the batch. A failed object
+   is retried once after settling: the usual cause is a stale modal, not the
+   object. For an object whose space is covered by something else, `--selected`
+   edits what you have selected.
 6. **Verify a dialog value without screenshots** — reopen the dialog, read the
    field, then Cancel.
 7. **Read annotation text** — export the view to PDF and extract with `pypdf`.
