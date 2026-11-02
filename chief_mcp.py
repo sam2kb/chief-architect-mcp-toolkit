@@ -1264,20 +1264,13 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
     if limit:
         chosen = chosen[:limit]
 
-    results = []
-    for obj in chosen:
+    async def attempt(obj):
+        """Open, write, confirm one object. Returns a report entry either way."""
         entry = {"objectId": obj["objectId"], "name": obj.get("name")}
-        if not apply:
-            results.append({**entry, "planned": True})
-            continue
-
         try:
             dialog = await open_spec_anywhere(session, obj, objects_list, expect=expect)
         except RuntimeError as exc:
-            results.append({**entry, "error": str(exc)})
-            if on_error == "stop":
-                break
-            continue
+            return {**entry, "error": str(exc)}
 
         question = dialog.get("questionId")
         try:
@@ -1292,12 +1285,38 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
             if not written.get("written"):
                 raise RuntimeError(written.get("refusal") or "field was refused")
             await press(session, "0", "OK", question)
-            results.append({**entry, "ok": True, "after": written.get("after")})
+            return {**entry, "ok": True, "after": written.get("after")}
         except Exception as exc:  # noqa: BLE001
             await _cancel(session, question)
-            results.append({**entry, "error": str(exc)})
-            if on_error == "stop":
-                break
+            return {**entry, "error": str(exc)}
+        finally:
+            if apply:
+                # Closing the dialog is not always enough: a cancelled attempt can
+                # leave a caret on the canvas, and the next object then fails on a
+                # gesture that never answers. This is a no-op unless Chief already
+                # has the keyboard, so it costs nothing when it cannot help.
+                send_escape()
+
+    results = []
+    for obj in chosen:
+        if not apply:
+            results.append({"objectId": obj["objectId"], "name": obj.get("name"),
+                            "planned": True})
+            continue
+
+        entry = await attempt(obj)
+        if entry.get("error"):
+            # Most failures here are a stale modal or a caret, not the object, and
+            # the watchdog has already cleared those. One retry, after settling,
+            # turns those into successes without hiding a real refusal.
+            await settle(session)
+            retried = await attempt(obj)
+            if not retried.get("error"):
+                entry = {**retried, "retried": True}
+
+        results.append(entry)
+        if entry.get("error") and on_error == "stop":
+            break
 
     if apply:
         # one dialog per object leaves a lot of chances to strand a command
@@ -1594,11 +1613,17 @@ async def _main(args):
             for field in info["fields"]:
                 print(f"  {str(field['id']):<34} {str(field['value'])[:38]:<40} {field['support']}")
         elif args.cmd == "apply":
-            targets = match_objects(await objects(s), name=args.name, layer=args.layer,
-                                    floor=args.floor, exact=args.exact)
-            if not targets:
-                print("nothing matched")
-                return
+            if args.selected:
+                targets = await selection(s)
+                if not targets:
+                    print("nothing is selected in the front view")
+                    return
+            else:
+                targets = match_objects(await objects(s), name=args.name, layer=args.layer,
+                                        floor=args.floor, exact=args.exact)
+                if not targets:
+                    print("nothing matched")
+                    return
             report = await apply_property(s, targets, args.field, value=args.value,
                                           option=args.option, panel=args.panel,
                                           apply=args.apply, limit=args.limit,
@@ -1720,6 +1745,8 @@ def main(argv=None):
     inspect.add_argument("--panel")
     inspect.add_argument("--expect", help="require this word in the dialog title (default: from the object name)")
     bulk = sub.add_parser("apply", help="write one dialog field on many matching objects")
+    bulk.add_argument("--selected", action="store_true",
+                      help="use the current selection instead of a name/layer/floor match")
     bulk.add_argument("--name")
     bulk.add_argument("--layer")
     bulk.add_argument("--floor", type=int)
