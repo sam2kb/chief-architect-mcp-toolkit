@@ -701,6 +701,7 @@ async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts
     for x, y in _candidate_points(bounds, objects, skip_ids, attempts):
         dialog = await dblclick(session, x, y)
         if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
+            await _dismiss_trial(session, dialog)
             continue
         title = dialog.get("title") or ""
         if expect and expect.lower() not in title.lower():
@@ -801,28 +802,42 @@ async def reachable_point(session, obj, steps: int = 7, presses: int = 8):
 
 
 async def open_spec_anywhere(session, obj, objects, expect=None, steps=7):
-    """Open an object's Specification dialog on a point proven to hit the object.
+    """Open an object's Specification dialog, trying the points that suit it.
 
     Double-clicking a guessed point is what starts an in-place edit when the guess
-    lands on a dimension number. So the point is found with single clicks first,
-    read back through the selection, and only that point is double-clicked.
+    lands on a dimension number. So the first attempt is a point proven by a single
+    click, the second is the object's own interior point, and only then the
+    geometric guesses. A point can select the object and still double-click onto
+    something else, so a wrong dialog sends it on to the next attempt rather than
+    ending the run.
     """
+    wrong: list = []
+
+    def accepted(dialog):
+        if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
+            return None
+        title = dialog.get("title") or ""
+        if expect and expect.lower() not in title.lower():
+            wrong.append(title)
+            return None
+        return dialog
+
     point = await reachable_point(session, obj, steps=steps)
-    if point is None:
-        # Not every object can be selected by clicking it: a room does not take a
-        # single-click selection here. Fall back to the geometric guess, which is
-        # what rooms used before the verified path existed.
-        return await open_spec(session, bbox(obj), objects,
-                               skip_ids=[obj["objectId"]], expect=expect)
-    dialog = await dblclick(session, *point)
-    if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
-        send_escape(steal=True)
-        raise RuntimeError("the point selects the object but opened no dialog")
-    title = dialog.get("title") or ""
-    if expect and expect.lower() not in title.lower():
-        await press(session, "1", "Cancel", dialog.get("questionId"))
-        raise RuntimeError(f"selected the object but the dialog opened was {title!r}")
-    return dialog
+    if point is not None:
+        dialog = await dblclick(session, *point)
+        if accepted(dialog) is not None:
+            return dialog
+        await _dismiss_trial(session, dialog)
+
+    location = obj.get("location") or {}
+    if "x" in location and "y" in location:
+        dialog = await dblclick(session, location["x"], location["y"])
+        if accepted(dialog) is not None:
+            return dialog
+        await _dismiss_trial(session, dialog)
+
+    return await open_spec(session, bbox(obj), objects,
+                           skip_ids=[obj["objectId"]], expect=expect)
 
 
 @asynccontextmanager
@@ -1080,7 +1095,7 @@ async def describe_fields(session, object_id, objects_list=None, panel=None):
 
 async def apply_property(session, targets, field_id, value=None, option=None, panel=None,
                          apply=False, limit=None, on_error="stop", expect=None,
-                         snapshot=None):
+                         snapshot=None, enable=None, enable_value=True):
     """Write one dialog field on every target object.
 
     A multi-object dialog edits only the object you double-clicked, so the only
@@ -1090,6 +1105,9 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
     Pass ``expect`` with a word from the dialog title ("Door", "Room") so a
     click that lands on a neighbouring object is rejected instead of edited.
     Pass ``snapshot`` to abort the whole run when the document has moved on.
+    Pass ``enable`` with a checkbox field that gates the one you want to write --
+    a room's ceiling height is disabled while it follows the structure default,
+    for instance -- and it is set before the write.
     """
     if snapshot is not None:
         check = await preflight(session, snapshot, [o["objectId"] for o in targets])
@@ -1121,6 +1139,10 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
         try:
             if panel:
                 await dialog_fields(session, panel=panel)
+            if enable:
+                toggled = await set_field(session, enable, value=enable_value, question=question)
+                if not toggled.get("written"):
+                    raise RuntimeError(toggled.get("refusal") or f"{enable} was refused")
             written = await set_field(session, field_id, value=value,
                                       option=option, question=question)
             if not written.get("written"):
@@ -1145,6 +1167,21 @@ async def _cancel(session, question):
         await press(session, "1", "Cancel", question)
     except Exception:  # noqa: BLE001
         pass
+
+
+async def _dismiss_trial(session, dialog):
+    """Undo whatever a probe double-click opened: a dialog, or an in-place edit.
+
+    A double-click that opens no dialog has usually started an in-place edit on a
+    dimension number. That holds the keyboard, refuses every later gesture, and
+    is invisible to the dialog tools, so Escape is the only way out -- and every
+    probe that decides not to use what it opened has to leave through here.
+    """
+    if isinstance(dialog, dict) and dialog.get("kind") == "dialog" and dialog.get("questionId"):
+        await _cancel(session, dialog["questionId"])
+        return
+    send_escape(steal=True)
+    time.sleep(0.1)
 
 
 # --------------------------------------------------------------------------
@@ -1421,7 +1458,10 @@ async def _main(args):
             report = await apply_property(s, targets, args.field, value=args.value,
                                           option=args.option, panel=args.panel,
                                           apply=args.apply, limit=args.limit,
-                                          expect=args.expect, snapshot=args.snapshot_data)
+                                          expect=args.expect, snapshot=args.snapshot_data,
+                                          enable=args.enable,
+                                          enable_value=args.enable_value == "true",
+                                          on_error=args.on_error)
             done = sum(1 for r in report["results"] if r.get("ok") or r.get("planned"))
             state = "applied" if report["applied"] else "planned"
             print(f"{state}: {done}/{report['count']}")
@@ -1524,6 +1564,11 @@ def main(argv=None):
     bulk.add_argument("--limit", type=int)
     bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     bulk.add_argument("--expect", help="require this word in the dialog title, e.g. Door")
+    bulk.add_argument("--enable", help="tick this checkbox field before writing, e.g. a 'use default' gate")
+    bulk.add_argument("--enable-value", choices=["true", "false"], default="true",
+                      help="what to set the gating checkbox to (default true)")
+    bulk.add_argument("--on-error", choices=["stop", "continue"], default="stop",
+                      help="keep going after an object fails (default stop)")
     bulk.add_argument("--snapshot", help="abort unless the document still matches this snapshot")
     sub.add_parser("clear", help="cancel a stuck dialog")
     stl = sub.add_parser("settle", help="cancel dialogs, tap Escape, clear the selection")
