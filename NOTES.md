@@ -61,6 +61,35 @@ server, which needs a Google API key and is not registered by default.
    Complete but noisy: some styles come out letter-spaced, and dimensions
    interleave with notes.
 
+## What was measured
+
+Everything below was run against build `28.2.1.14` on 2026-11-01, Project
+Management off, and is written down because most of it was not what we assumed.
+
+| Question | Answer | How it was checked |
+|---|---|---|
+| Do gestures work while Chief is behind another window, or minimized? | Yes. Clicks and double-clicks land in all three states | the same double-click run covered, minimized and focused; a 9-door click-and-read hit test scored identically each way |
+| Does Ctrl+click cycle through overlapping objects? | No. The selection stays on the topmost object | plain click, then three Ctrl+clicks, on every door a plain click missed |
+| Does Tab cycle? | Yes, usually one press | click, then Tab, reading the selection after each press: `Marker` → `Hinged Door` |
+| Can a covered object be reached at all? | Yes. 8 of 9 doors, usually within one click of centre | 7×7 grid of clicks across each door's bounds, reading the selection back |
+| Is a *refused* gesture the only way the app gets stuck? | No, and this is the important one. It can hold a caret with no refused calls at all | a traced 26-gesture run: 0 failures, 0 exceptions, every call completed, and the dimension field was still open |
+| What clears an in-place canvas edit? | Escape, delivered while Chief owns the foreground. Nothing else does | reproduced with a Specification dialog, which refuses gestures the same way |
+| Does a dialog's focused edit box hold input? | Yes, indefinitely, with a message naming the dialog | open any Specification dialog, then send a gesture |
+| Is the "hang" in this client? | No. Every MCP call completed in both a bad run and a good one | `CAMCP_TRACE=1`: 95–160 calls, each with a matching completion, none slower than 0.55 s |
+| Does the front-most view matter? | Yes. Listings describe the front-most view, which may be a saved plan view rather than the floor plan | `views` reported `Mechanical Plan View` front-most; object counts drifted 76–79 between runs |
+| Do drags commit? | No. Only dialog field writes do | single drag, long drag, and press/move/release all reported success with positions unchanged |
+
+Three rules fell out of that:
+
+1. **Clean up unconditionally, not on failure.** Escape sent in reaction to a
+   refusal never fires, because the stuck state does not refuse anything. Cancel,
+   Escape, and clear the selection after *every* object, in a `finally`.
+2. **Double-click only a point that a single click proved**, by reading the
+   selection back. A guessed double-click on a dimension number starts an
+   in-place edit, and that is what strands the app.
+3. **Never take the foreground implicitly.** It steals the keyboard from whoever
+   is typing, and the ALT tap needed for it can leave a menu grabbed.
+
 ## Pitfalls
 
 - **An in-place edit on the canvas holds the keyboard too, and hides better.**

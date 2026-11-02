@@ -11,6 +11,31 @@ tool writes its payload to a temp JSON report and returns only a filename.
 
 This toolkit papers over that, and records what actually works.
 
+## Use at your own risk
+
+**This code drives a real CAD program and edits real drawings. It can destroy
+work, and it has.** Read this before pointing it at anything you care about.
+
+- **Back up, and work on a copy.** No undo is offered or guaranteed. Some
+  operations refuse to be undone at all.
+- **The MCP surface is undocumented and unversioned.** Anything here can break
+  on a Chief Architect update, a build number, a preference change, or a UI
+  setting, without warning and without a deprecation period.
+- **It is incomplete and lightly tested.** Continuous testing is a handful of
+  unit tests against pure functions — nothing exercises the app itself. The
+  integration paths have been run on one machine, one build (`28.2.1.14`), with
+  Project Management off. Several are known to be flaky.
+- **The input layer is Win32 keystroke injection.** It sends real mouse and
+  keyboard events. A mis-aimed click lands on whatever is under it, in whatever
+  window has focus. Delete and other destructive hotkeys are refused by the
+  server by design, and that refusal is only as strong as this code's restraint.
+- **Identifiers, coordinates and viewport state go stale** the moment anyone
+  touches the file. A stale object id or a stale point edits the wrong thing.
+- **Not affiliated with, endorsed by, or supported by Chief Architect.** No
+  warranty of any kind; see the licence. If it corrupts a plan, that is on you.
+
+If that is not what you want, stop here.
+
 ## What is in here
 
 | File | Purpose |
