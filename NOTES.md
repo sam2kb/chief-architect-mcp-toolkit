@@ -63,6 +63,16 @@ server, which needs a Google API key and is not registered by default.
 
 ## Pitfalls
 
+- **Gestures are not blocked by a background window, but activation is blocked
+  until ALT is tapped.** Measured here: the same double-click opened its dialog
+  with Chief covered by another app, minimized, and in front; a 9-door
+  click-and-read-selection hit test scored identically either way. What does
+  fail is `SetForegroundWindow` from a background process, which returns true
+  while the foreground stays put -- a plain click on the window works because
+  the click itself activates it. `ensure_active()` reproduces that, and every
+  gesture reply now carries an `activation` block saying what the foreground
+  was, so "it stopped responding" can be answered from the log rather than by
+  memory.
 - **Delete is refused on purpose.** Rebinding it to a fresh hotkey does not help;
   the server recognises the action. Park objects at a fixed offset and record
   their original positions so they can be restored.

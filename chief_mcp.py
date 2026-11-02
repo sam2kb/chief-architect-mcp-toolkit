@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import hashlib
 import json
 import math
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -187,6 +189,92 @@ async def status(session):
 
 
 # --------------------------------------------------------------------------
+# window activation -- the manual "click into Chief" step, done for you
+# --------------------------------------------------------------------------
+VK_MENU, KEYEVENTF_KEYUP, SW_RESTORE = 0x12, 0x0002, 9
+CHIEF_TITLE = "Chief Architect Premier"
+
+
+def _user32():
+    """user32, or None where there is no Windows API (the test suite runs anywhere)."""
+    windll = getattr(ctypes, "windll", None)
+    return getattr(windll, "user32", None) if windll is not None else None
+
+
+def window_title(hwnd, lib=None) -> str:
+    lib = lib or _user32()
+    if lib is None or not hwnd:
+        return ""
+    buf = ctypes.create_unicode_buffer(512)
+    lib.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
+def find_window(title_part: str = CHIEF_TITLE, lib=None):
+    """First visible top-level window whose title contains ``title_part``."""
+    lib = lib or _user32()
+    if lib is None:
+        return None
+    found: list = []
+    callback_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+
+    @callback_type(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def visit(hwnd, _param):
+        if lib.IsWindowVisible(hwnd) and title_part.lower() in window_title(hwnd, lib).lower():
+            found.append(hwnd)
+        return True
+
+    lib.EnumWindows(visit, None)
+    return found[0] if found else None
+
+
+def foreground_title(lib=None) -> str:
+    lib = lib or _user32()
+    return "" if lib is None else window_title(lib.GetForegroundWindow(), lib)
+
+
+def activate_window(hwnd, lib=None) -> str:
+    """Bring ``hwnd`` to the front; returns the foreground title afterwards.
+
+    Windows refuses ``SetForegroundWindow`` from a process that does not own the
+    foreground. Tapping ALT clears that lock, which is the programmatic version of
+    clicking the window's title bar.
+    """
+    lib = lib or _user32()
+    if lib is None:
+        return ""
+    lib.keybd_event(VK_MENU, 0, 0, 0)
+    lib.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    lib.ShowWindow(hwnd, SW_RESTORE)
+    lib.SetForegroundWindow(hwnd)
+    return foreground_title(lib)
+
+
+def ensure_active(title_part: str = CHIEF_TITLE, lib=None, attempts: int = 12,
+                  delay: float = 0.05) -> dict:
+    """Make Chief the foreground window. Safe to call before any gesture batch.
+
+    The switch is not instant: the foreground window reads as empty or as the old
+    window for a moment, so the result is polled rather than taken once.
+    """
+    hwnd = find_window(title_part, lib)
+    if hwnd is None:
+        return {"active": False, "changed": False, "reason": "no Chief window found",
+                "foreground": foreground_title(lib)}
+    current = foreground_title(lib)
+    if title_part.lower() in (current or "").lower():
+        return {"active": True, "changed": False, "foreground": current}
+    after = activate_window(hwnd, lib)
+    for _ in range(max(attempts, 1)):
+        if title_part.lower() in (after or "").lower():
+            break
+        time.sleep(delay)
+        after = foreground_title(lib)
+    return {"active": title_part.lower() in (after or "").lower(),
+            "changed": True, "foreground": after}
+
+
+# --------------------------------------------------------------------------
 # input (pointer only -- hotkeys and commands need Project Management)
 # --------------------------------------------------------------------------
 async def select(session, object_ids):
@@ -194,16 +282,28 @@ async def select(session, object_ids):
     return data.get("count", 0)
 
 
-async def click(session, x, y):
-    return await call(session, "chief_input_canvas_gesture",
-                      gestures=[{"type": "click", "button": "left", "x": x, "y": y}])
+async def gesture(session, gestures, activate=True):
+    """Send canvas gestures, giving Chief the foreground first.
 
-
-async def dblclick(session, x, y):
-    """Open a Specification dialog. Returns the dialog descriptor."""
-    data = await call(session, "chief_input_canvas_gesture",
-                      gestures=[{"type": "doubleClick", "button": "left", "x": x, "y": y}])
+    Clicks do land while Chief is covered or minimized, so this is not strictly
+    required -- but Windows only hands over the foreground after an ALT tap, and
+    an inactive window is where runs looked like they had stalled. ``activation``
+    in the reply records what happened, so a run can be explained afterwards.
+    """
+    state = ensure_active() if activate else None
+    data = await call(session, "chief_input_canvas_gesture", gestures=gestures)
+    if state is not None and isinstance(data, dict):
+        data["activation"] = state
     return data
+
+
+async def click(session, x, y, activate=True):
+    return await gesture(session, [{"type": "click", "button": "left", "x": x, "y": y}], activate)
+
+
+async def dblclick(session, x, y, activate=True):
+    """Open a Specification dialog. Returns the dialog descriptor."""
+    return await gesture(session, [{"type": "doubleClick", "button": "left", "x": x, "y": y}], activate)
 
 
 async def export_image(session, path):
@@ -1005,6 +1105,12 @@ async def _main(args):
                       f"dw={item['dw']} dd={item['dd']}")
             for item in result["removed"]:
                 print(f"  removed {str(item['name']):<18} {str(item.get('objectId'))[:8]}")
+        elif args.cmd == "active":
+            before = foreground_title()
+            state = ensure_active()
+            print(f"foreground before : {before!r}")
+            print(f"foreground after  : {state.get('foreground')!r}")
+            print(f"active={state.get('active')} changed={state.get('changed')}")
         elif args.cmd == "views":
             for v in await views(s):
                 front = "*" if v.get("front") else " "
@@ -1059,6 +1165,7 @@ def main(argv=None):
     difference.add_argument("before")
     difference.add_argument("--out")
     bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
+    sub.add_parser("active", help="bring Chief to the front and report the foreground window")
     sub.add_parser("views", help="open views")
     doc = sub.add_parser("docs", help="search Chief's help")
     doc.add_argument("query")

@@ -25,7 +25,12 @@ This toolkit papers over that, and records what actually works.
 Reads: `objects`, `properties`, `rooms`, `selection`, `views`, `commands`,
 `docs`, `status`.
 
-Input: `select`, `click`, `dblclick`, `export_image`, `export_pdf`.
+Input: `select`, `click`, `dblclick`, `export_image`, `export_pdf`. Clicks go
+through `gesture`, which gives Chief the foreground first: Windows refuses
+`SetForegroundWindow` from a background process until an ALT tap unlocks it, so
+`ensure_active` does that tap, restores the window and waits for the switch to
+settle. `foreground_title` and `find_window` are the read-backs behind it, and
+`python chief_mcp.py active` runs the same thing from a shell.
 
 Dialogs (the reliable way to edit anything): `dialog_fields`, `find_node`,
 `node_value`, `set_field`, `press`.
