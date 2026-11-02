@@ -809,7 +809,11 @@ async def open_spec_anywhere(session, obj, objects, expect=None, steps=7):
     """
     point = await reachable_point(session, obj, steps=steps)
     if point is None:
-        raise RuntimeError("no click inside those bounds selects the object")
+        # Not every object can be selected by clicking it: a room does not take a
+        # single-click selection here. Fall back to the geometric guess, which is
+        # what rooms used before the verified path existed.
+        return await open_spec(session, bbox(obj), objects,
+                               skip_ids=[obj["objectId"]], expect=expect)
     dialog = await dblclick(session, *point)
     if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
         send_escape(steal=True)
@@ -1039,7 +1043,11 @@ def match_objects(objects_list, name=None, layer=None, floor=None, exact=False):
 
 
 async def describe_fields(session, object_id, objects_list=None, panel=None):
-    """Open one object's dialog, list its writable fields, then cancel."""
+    """Open one object's dialog and list its fields, without changing anything.
+
+    Returns the panel names too: the dialog payload carries them, and guessing a
+    panel name is what makes looking for a field tedious.
+    """
     objs = objects_list if objects_list is not None else await objects(session)
     target = next((o for o in objs if o["objectId"] == object_id), None)
     if target is None:
@@ -1050,6 +1058,10 @@ async def describe_fields(session, object_id, objects_list=None, panel=None):
     try:
         found = await dialog_fields(session, panel=panel)
         panel_data = found.get("panel") or {}
+        # the gesture payload carries the panel names, and so does the field
+        # listing; take whichever answers
+        names = (dialog.get("panels") or found.get("panels") or [])
+        panels = [p.get("name") for p in names if p.get("name")] or None
         fields = [
             {
                 "id": node.get("id"),
@@ -1060,7 +1072,8 @@ async def describe_fields(session, object_id, objects_list=None, panel=None):
             for node in (panel_data.get("nodes") or [])
             if node.get("kind") == "field"
         ]
-        return {"title": dialog.get("title"), "panel": panel_data.get("title"), "fields": fields}
+        return {"title": dialog.get("title"), "panel": panel_data.get("title"),
+                "panels": panels, "fields": fields}
     finally:
         await _cancel(session, question)
 
@@ -1395,6 +1408,8 @@ async def _main(args):
         elif args.cmd == "fields":
             info = await describe_fields(s, args.object_id, panel=args.panel)
             print(f"{info['title']} / {info['panel']}")
+            if info.get("panels"):
+                print("  panels: " + ", ".join(info["panels"]))
             for field in info["fields"]:
                 print(f"  {str(field['id']):<34} {str(field['value'])[:38]:<40} {field['support']}")
         elif args.cmd == "apply":
