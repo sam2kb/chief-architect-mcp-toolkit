@@ -152,10 +152,20 @@ class SendEscapeTests(unittest.TestCase):
 
     def test_other_keys_are_refused(self):
         lib = FakeUser32({2: "Chief Architect Premier X18"}, foreground=2)
-        for name in ("Delete", "Ctrl+Z", "Enter"):
+        for name in ("Delete", "Ctrl+Z", "Ctrl+V", "Backspace", "F2"):
             with self.assertRaises(ValueError):
                 chief_mcp.send_key(name, lib=lib)
         self.assertEqual(lib.calls, [])
+
+    def test_ctrl_e_sends_the_modifier_around_the_key(self):
+        lib = FakeUser32({2: "Chief Architect Premier X18"}, foreground=2)
+        self.assertTrue(chief_mcp.send_key("Ctrl+E", lib=lib, delay=0))
+        self.assertEqual(lib.calls, [
+            ("keybd_event", chief_mcp.VK_CONTROL),
+            ("keybd_event", 0x45),
+            ("keybd_event", 0x45),
+            ("keybd_event", chief_mcp.VK_CONTROL),
+        ])
 
     def test_refuses_to_type_into_whichever_app_is_in_front(self):
         lib = FakeUser32({1: "Visual Studio Code", 2: "Chief Architect Premier X18"},

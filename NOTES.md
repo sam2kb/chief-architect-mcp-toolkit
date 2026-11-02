@@ -32,6 +32,7 @@ server, which needs a Google API key and is not registered by default.
 | Search bundled help docs | works |
 | Pointer click, double-click, scroll | works |
 | Tab, to cycle the selection through stacked objects | works, when sent as a real keystroke |
+| Ctrl+E, to open the selected object's specification | opens it, but as an untracked modal: force-close only |
 | Escape, to cancel an in-place edit | works as a real keystroke; not reachable over MCP |
 | Drag to move an object | **no-op** |
 | `invoke_command`, `input_hotkey`, `open_document`, project browser | refused: needs project management mode (this build) |
@@ -97,6 +98,13 @@ Three rules fell out of that:
 
 ## Pitfalls
 
+- **A dialog opened by keyboard is not scriptable, and reading it hangs.** Ctrl+E
+  does open the selected object's specification, which is why it looks like the
+  way around double-clicking. But the dialog arrives with `agentTracked: false`:
+  `chief_set_dialog_field` and `chief_click_dialog_button` need a tracked question
+  id, so it can only be force-closed, and asking for its fields blocks forever
+  instead of refusing. Dialog calls now time out (`DIALOG_TIMEOUT`) so that a
+  wrong-state call is an error rather than a hang.
 - **An in-place edit on the canvas holds the keyboard too, and hides better.**
   Select an object, click the dimension number, and Chief puts a caret on the
   canvas waiting for digits. There is no dialog: `discover_open_dialogs` reports

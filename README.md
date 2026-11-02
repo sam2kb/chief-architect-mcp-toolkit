@@ -228,6 +228,7 @@ Read `NOTES.md` for the detail. What works and what does not:
 | Gestures while Chief is behind another window, or minimized | work; the window does not need the foreground |
 | Picking an object with something on top of it | works: Tab cycles the stack under the cursor; Ctrl+click does not |
 | An in-place edit (click a dimension number) | holds the keyboard indefinitely; only Escape clears it |
+| Ctrl+E on a selection | opens the specification, but untracked: it can only be closed |
 | Bringing Chief to the front | works, but takes the keyboard; opt-in only |
 | Synthetic drags | do not commit; positions never change |
 | Text object contents | not exposed anywhere |

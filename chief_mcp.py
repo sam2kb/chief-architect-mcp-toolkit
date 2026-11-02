@@ -122,6 +122,10 @@ load_env()
 
 SERVER_NAME = os.environ.get("CAMCP_SERVER", "ca-mcp-x18")
 
+# Seconds before a dialog call gives up. Reading a dialog when no agent-tracked
+# one is open blocks indefinitely -- it waits for a question that never arrives.
+DIALOG_TIMEOUT = 15.0
+
 
 # --------------------------------------------------------------------------
 # transport
@@ -180,13 +184,21 @@ def _payload(result):
     return merged
 
 
-async def call(session: ClientSession, tool: str, **arguments):
-    """Call a tool; report files are loaded for you."""
+async def call(session: ClientSession, tool: str, timeout=None, **arguments):
+    """Call a tool; report files are loaded for you.
+
+    ``timeout`` exists because some tools block instead of refusing: a dialog tool
+    called when no agent-tracked dialog is open waits for one that is never
+    coming. A deadline turns that into an error, which is recoverable.
+    """
     args = {k: v for k, v in arguments.items() if v is not None}
     started = time.monotonic()
     _trace({"event": "call", "tool": tool, "args": args})
     try:
-        payload = _payload(await session.call_tool(tool, args))
+        if timeout:
+            payload = _payload(await asyncio.wait_for(session.call_tool(tool, args), timeout))
+        else:
+            payload = _payload(await session.call_tool(tool, args))
     except BaseException as exc:
         _trace({"event": "raise", "tool": tool, "error": repr(exc),
                 "seconds": round(time.monotonic() - started, 3)})
@@ -245,14 +257,18 @@ async def status(session):
 # --------------------------------------------------------------------------
 # window activation -- the manual "click into Chief" step, done for you
 # --------------------------------------------------------------------------
-VK_MENU, VK_ESCAPE, VK_TAB, KEYEVENTF_KEYUP, SW_RESTORE = 0x12, 0x1B, 0x09, 0x0002, 9
+VK_MENU, VK_ESCAPE, VK_TAB, VK_RETURN, VK_CONTROL = 0x12, 0x1B, 0x09, 0x0D, 0x11
+KEYEVENTF_KEYUP, SW_RESTORE = 0x0002, 9
 CHIEF_TITLE = "Chief Architect Premier"
 
 # Escape dismisses a text edit; Tab cycles the selection through objects stacked
-# under the cursor, which is how a covered object gets picked. Both are additive
-# to the selection, not to the drawing. Everything else -- Delete above all -- is
+# under the cursor, which is how a covered object gets picked; Enter does nothing
+# helpful; Ctrl+E opens the properties of whatever is selected, which is the whole
+# reason a canvas double-click is avoidable. All of these act on the selection or
+# a pending edit, not on the drawing. Everything else -- Delete above all -- is
 # refused by the server on purpose and stays refused here.
-SAFE_KEYS = {"Escape": VK_ESCAPE, "Tab": VK_TAB}
+SAFE_KEYS = {"Escape": VK_ESCAPE, "Tab": VK_TAB, "Enter": VK_RETURN}
+SAFE_COMBOS = {"Ctrl+E": (VK_CONTROL, 0x45)}
 
 
 def _user32():
@@ -354,8 +370,9 @@ def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08,
     (dismiss an in-place edit) and Tab (cycle the selection through stacked
     objects), neither of which changes the drawing.
     """
-    if name not in SAFE_KEYS:
-        raise ValueError(f"{name!r} is not on the allowed list: {sorted(SAFE_KEYS)}")
+    if name not in SAFE_KEYS and name not in SAFE_COMBOS:
+        allowed = sorted(set(SAFE_KEYS) | set(SAFE_COMBOS))
+        raise ValueError(f"{name!r} is not on the allowed list: {allowed}")
     lib = lib or _user32()
     if lib is None:
         return False
@@ -371,11 +388,15 @@ def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08,
         activate_window(hwnd, lib)
         stolen = True
 
-    vk = SAFE_KEYS[name]
+    modifier, vk = SAFE_COMBOS.get(name, (0, SAFE_KEYS.get(name)))
     try:
         for _ in range(max(presses, 1)):
+            if modifier:
+                lib.keybd_event(modifier, 0, 0, 0)
             lib.keybd_event(vk, 0, 0, 0)
             lib.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+            if modifier:
+                lib.keybd_event(modifier, 0, KEYEVENTF_KEYUP, 0)
             time.sleep(delay)
     finally:
         if stolen and previous:
@@ -507,7 +528,8 @@ async def export_pdf(session, path):
 # dialogs (the reliable edit channel)
 # --------------------------------------------------------------------------
 async def dialog_fields(session, panel=None):
-    return await call(session, "chief_discover_dialog_fields", panel=panel)
+    return await call(session, "chief_discover_dialog_fields", panel=panel,
+                      timeout=DIALOG_TIMEOUT)
 
 
 def find_node(fields, node_id):
@@ -528,13 +550,14 @@ async def set_field(session, field_id, value=None, option=None, label=None, ques
     return await call(
         session, "chief_set_dialog_field",
         fieldId=field_id, value=value, optionId=option, label=label, questionId=question,
+        timeout=DIALOG_TIMEOUT,
     )
 
 
 async def press(session, choice, label, question=None):
     return await call(
         session, "chief_click_dialog_button",
-        choiceId=choice, label=label, questionId=question,
+        choiceId=choice, label=label, questionId=question, timeout=DIALOG_TIMEOUT,
     )
 
 
@@ -579,25 +602,48 @@ def contains(b, x, y):
     return b["minX"] <= x <= b["maxX"] and b["minY"] <= y <= b["maxY"]
 
 
+# How far a dimension's number sits from the line it belongs to, in inches. The
+# number is outside the line's own box, which is why avoiding the box is not
+# enough to avoid the number.
+NUMBER_PAD = 12.0
+NUMBER_WORDS = ("dimension", "text")
+
+
+def carries_number(obj) -> bool:
+    """True for objects that display an editable number: dimensions and text."""
+    name = (obj.get("name") or "").lower()
+    return any(word in name for word in NUMBER_WORDS)
+
+
 def free_point(bounds, objects, skip_ids=(), skip_names=("Room", "Exterior room"),
-               skip_layers=("Rooms",), margin=6.0, steps=25):
+               skip_layers=("Rooms",), margin=6.0, steps=25, number_pad=0.0):
     """Point inside ``bounds`` clear of every other object's bounding box.
 
     A room's reported interior point can sit under a dimension line, so a
     double-click aimed at it hits the dimension instead of the room. Candidates
     are tried from the centre outward.
 
+    ``number_pad`` inflates the boxes of objects that carry editable numbers --
+    dimension lines and text -- because the number sits offset from the line it
+    belongs to. A double-click on that number opens an in-place editor which then
+    holds the keyboard, so it is worth keeping clear of.
+
     Room-layer objects are excluded by default: room bounding boxes overlap their
     neighbours, and the exterior room spans the whole building, so treating them
     as obstacles would reject every candidate.
     """
     skip = set(skip_ids)
-    obstacles = [
-        bbox(o) for o in objects
-        if o.get("objectId") not in skip
-        and o.get("name") not in skip_names
-        and o.get("layer") not in skip_layers
-    ]
+    obstacles = []
+    for obj in objects:
+        if (obj.get("objectId") in skip
+                or obj.get("name") in skip_names
+                or obj.get("layer") in skip_layers):
+            continue
+        box = bbox(obj)
+        if number_pad and carries_number(obj):
+            box = {"minX": box["minX"] - number_pad, "maxX": box["maxX"] + number_pad,
+                   "minY": box["minY"] - number_pad, "maxY": box["maxY"] + number_pad}
+        obstacles.append(box)
     cx = (bounds["minX"] + bounds["maxX"]) / 2
     cy = (bounds["minY"] + bounds["maxY"]) / 2
     span_x = bounds["maxX"] - bounds["minX"] - 2 * margin
@@ -666,7 +712,7 @@ def parse_inches(text: str) -> float:
 # --------------------------------------------------------------------------
 def _candidate_points(bounds, objects, skip_ids=(), attempts=4):
     """Ordered double-click targets: the free point first, then fallbacks."""
-    points = [free_point(bounds, objects, skip_ids=skip_ids)]
+    points = [free_point(bounds, objects, skip_ids=skip_ids, number_pad=NUMBER_PAD)]
     points.append(((bounds["minX"] + bounds["maxX"]) / 2,
                    (bounds["minY"] + bounds["maxY"]) / 2))
     for fx, fy in ((0.25, 0.25), (0.75, 0.75), (0.25, 0.75), (0.75, 0.25)):
@@ -683,6 +729,37 @@ def _candidate_points(bounds, objects, skip_ids=(), attempts=4):
         seen.add(key)
         ordered.append((x, y))
     return ordered[:attempts]
+
+
+def title_matches(expect, title) -> bool:
+    """True when a dialog title satisfies ``expect``: a word, or any of several.
+
+    Object names and dialog titles rarely agree exactly -- a "Hinged Door" opens
+    an "Exterior Door Specification" -- so callers pass the words worth matching
+    rather than the whole name.
+    """
+    if not expect:
+        return True
+    title = (title or "").lower()
+    if isinstance(expect, str):
+        return expect.lower() in title
+    return any(str(word).lower() in title for word in expect)
+
+
+def title_tokens(name):
+    """Distinctive lowercase words from an object name, for title matching.
+
+    Short words and object suffixes are dropped: "Hinged Door" becomes ``door``,
+    which is what a Door Specification title actually contains, and ``block_4``
+    becomes ``block``.
+    """
+    raw = "".join(ch if ch.isalnum() else " " for ch in (name or "")).split()
+    words = []
+    for word in raw:
+        word = word.rstrip("0123456789").lower()
+        if len(word) > 3 and word not in words:
+            words.append(word)
+    return words or None
 
 
 async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts=4):
@@ -704,7 +781,7 @@ async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts
             await _dismiss_trial(session, dialog)
             continue
         title = dialog.get("title") or ""
-        if expect and expect.lower() not in title.lower():
+        if not title_matches(expect, title):
             await press(session, "1", "Cancel", dialog.get("questionId"))
             wrong = title
             continue
@@ -817,7 +894,7 @@ async def open_spec_anywhere(session, obj, objects, expect=None, steps=7):
         if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
             return None
         title = dialog.get("title") or ""
-        if expect and expect.lower() not in title.lower():
+        if not title_matches(expect, title):
             wrong.append(title)
             return None
         return dialog
@@ -1057,18 +1134,24 @@ def match_objects(objects_list, name=None, layer=None, floor=None, exact=False):
     ]
 
 
-async def describe_fields(session, object_id, objects_list=None, panel=None):
+async def describe_fields(session, object_id, objects_list=None, panel=None, expect=None):
     """Open one object's dialog and list its fields, without changing anything.
 
     Returns the panel names too: the dialog payload carries them, and guessing a
     panel name is what makes looking for a field tedious.
+
+    The dialog is checked against the object's own name unless ``expect`` says
+    otherwise. Without that check a room that cannot be reached reports whatever
+    was under the click instead -- a dimension line, say -- which reads exactly
+    like a successful answer.
     """
     objs = objects_list if objects_list is not None else await objects(session)
     target = next((o for o in objs if o["objectId"] == object_id), None)
     if target is None:
         raise ValueError("that object is not in the front view")
 
-    dialog = await open_spec_anywhere(session, target, objs)
+    dialog = await open_spec_anywhere(session, target, objs,
+                                      expect=expect or title_tokens(target.get("name")))
     question = dialog.get("questionId")
     try:
         found = await dialog_fields(session, panel=panel)
@@ -1443,7 +1526,7 @@ async def _main(args):
                 print(f"{obj['objectId']}  {obj['name']:<20} layer={obj['layer']}")
             print(f"-- {len(hits)} match(es)")
         elif args.cmd == "fields":
-            info = await describe_fields(s, args.object_id, panel=args.panel)
+            info = await describe_fields(s, args.object_id, panel=args.panel, expect=args.expect)
             print(f"{info['title']} / {info['panel']}")
             if info.get("panels"):
                 print("  panels: " + ", ".join(info["panels"]))
@@ -1552,6 +1635,7 @@ def main(argv=None):
     inspect = sub.add_parser("fields", help="list an object's dialog fields, read-only")
     inspect.add_argument("object_id")
     inspect.add_argument("--panel")
+    inspect.add_argument("--expect", help="require this word in the dialog title (default: from the object name)")
     bulk = sub.add_parser("apply", help="write one dialog field on many matching objects")
     bulk.add_argument("--name")
     bulk.add_argument("--layer")
