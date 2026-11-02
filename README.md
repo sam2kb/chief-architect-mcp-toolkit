@@ -55,6 +55,12 @@ grabbed in the window that had focus. `recover(focus=True)` and
 `recover(keyboard=True)` taps Escape, which clears an in-place text edit that has
 no dialog to inspect.
 
+A refused gesture retries once with Escape when no dialog is open, which covers
+the state with no dialog to find: an in-place dimension edit. Escape can only
+reach Chief while Chief has the foreground, so that retry fronts it for a moment
+and restores the previous window. `python chief_mcp.py escape [--steal]` sends
+the same keystroke by hand.
+
 Set `CAMCP_TRACE=1` (and optionally `CAMCP_TRACE_FILE`) to append a line per MCP
 call to `~/.chief_mcp/trace.jsonl`. A hang shows up as a `call` with no matching
 `done`, which distinguishes "Chief is busy" from "the agent stopped talking".

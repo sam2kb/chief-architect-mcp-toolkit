@@ -63,6 +63,16 @@ server, which needs a Google API key and is not registered by default.
 
 ## Pitfalls
 
+- **An in-place edit on the canvas holds the keyboard too, and hides better.**
+  Select an object, click the dimension number, and Chief puts a caret on the
+  canvas waiting for digits. There is no dialog: `discover_open_dialogs` reports
+  nothing, so `clear_dialogs` has nothing to cancel, and every gesture is refused
+  from then on. Escape is the only thing that clears it, and a key only reaches
+  Chief while Chief has the foreground. `gesture()` now retries once with Escape
+  when a gesture is refused and no dialog is open, briefly fronting Chief and
+  putting the previous window back -- so the run unsticks instead of hanging, and
+  the window being typed into keeps its focus. `python chief_mcp.py escape` does
+  the same by hand.
 - **A focused edit box holds Chief hostage, indefinitely.** Open a Specification
   dialog, leave the cursor in a field, and every gesture comes back
   `success: false` with "Chief is showing an agent-tracked modal dialog".

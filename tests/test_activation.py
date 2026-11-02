@@ -164,6 +164,12 @@ class SendEscapeTests(unittest.TestCase):
         self.assertEqual(lib.calls, [],
                          "no keys, and no stealing the foreground to deliver them")
 
+    def test_steal_takes_the_key_and_gives_the_focus_back(self):
+        lib = FakeUser32({1: "Visual Studio Code", 2: "Chief Architect Premier X18"}, foreground=1)
+        self.assertTrue(chief_mcp.send_key("Escape", lib=lib, delay=0, steal=True))
+        self.assertIn(("keybd_event", chief_mcp.VK_ESCAPE), lib.calls)
+        self.assertEqual(lib.current, 1, "the window the user was typing in gets the focus back")
+
     def test_without_a_windows_api_it_reports_failure(self):
         with mock.patch.object(chief_mcp, "_user32", return_value=None):
             self.assertFalse(chief_mcp.send_escape())

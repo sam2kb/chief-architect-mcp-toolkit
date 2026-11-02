@@ -311,13 +311,24 @@ def ensure_active(title_part: str = CHIEF_TITLE, lib=None, attempts: int = 12,
             "changed": True, "foreground": after}
 
 
-def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08) -> bool:
-    """Tap a whitelisted key in whatever window has the foreground.
+def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08,
+             steal: bool = False) -> bool:
+    """Tap a whitelisted key in Chief.
+
+    Without ``steal`` this refuses unless Chief already owns the keyboard: a key
+    sent by ``keybd_event`` lands in whatever window is in front, and typing into
+    someone's editor is worse than failing.
+
+    With ``steal``, Chief is brought forward just long enough to take the key and
+    the previous window is put back afterwards. That is the only way to clear an
+    in-place edit while the person who triggered it is typing somewhere else, and
+    putting their window back is what keeps it from feeling like the app stole
+    the keyboard.
 
     Chief refuses hotkeys over MCP without Project Management, and Delete and the
     edit commands stay refused on purpose -- driving those through the keyboard
     would be a way around the guardrail. What is here is limited to Escape
-    (dismiss an in-place text edit) and Tab (cycle the selection through stacked
+    (dismiss an in-place edit) and Tab (cycle the selection through stacked
     objects), neither of which changes the drawing.
     """
     if name not in SAFE_KEYS:
@@ -325,22 +336,37 @@ def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08) -> bool
     lib = lib or _user32()
     if lib is None:
         return False
-    if CHIEF_TITLE.lower() not in (foreground_title(lib) or "").lower():
-        # keybd_event lands in whatever owns the foreground. Refuse rather than
-        # type into another window, and do not steal the foreground to get here:
-        # call ensure_active() first when fronting Chief is what you want.
-        return False
+
+    previous = lib.GetForegroundWindow()
+    stolen = False
+    if CHIEF_TITLE.lower() not in (window_title(previous, lib) or "").lower():
+        if not steal:
+            return False
+        hwnd = find_window(lib=lib)
+        if hwnd is None:
+            return False
+        activate_window(hwnd, lib)
+        stolen = True
+
     vk = SAFE_KEYS[name]
-    for _ in range(max(presses, 1)):
-        lib.keybd_event(vk, 0, 0, 0)
-        lib.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(delay)
+    try:
+        for _ in range(max(presses, 1)):
+            lib.keybd_event(vk, 0, 0, 0)
+            lib.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+            time.sleep(delay)
+    finally:
+        if stolen and previous:
+            try:
+                lib.SetForegroundWindow(previous)
+                time.sleep(0.1)  # the foreground reads empty mid-switch
+            except Exception:  # noqa: BLE001
+                pass
     return True
 
 
-def send_escape(lib=None, presses: int = 1, delay: float = 0.08) -> bool:
+def send_escape(lib=None, presses: int = 1, delay: float = 0.08, steal: bool = False) -> bool:
     """Press Escape. Kept as a name because it reads better at call sites."""
-    return send_key("Escape", lib=lib, presses=presses, delay=delay)
+    return send_key("Escape", lib=lib, presses=presses, delay=delay, steal=steal)
 
 
 async def cycle_selection(session, point, target_id, presses: int = 12):
@@ -399,7 +425,7 @@ async def recover(session, keyboard: bool = False, focus: bool = False) -> dict:
     steps["closed"] = closed
 
     if keyboard:
-        steps["escape"] = send_escape()
+        steps["escape"] = send_escape(steal=True)
     still = await call(session, "chief_discover_open_dialogs")
     steps["dialog_open"] = bool((still.get("trackedQuestion") or {}).get("active"))
     return steps
@@ -413,7 +439,7 @@ async def select(session, object_ids):
     return data.get("count", 0)
 
 
-async def gesture(session, gestures, activate=False):
+async def gesture(session, gestures, activate=False, unstick=True):
     """Send canvas gestures.
 
     ``activate`` is off by default on purpose. A click already brings Chief
@@ -421,11 +447,26 @@ async def gesture(session, gestures, activate=False):
     keyboard away from whatever the user is typing into -- it reads as the app
     hanging on input until they click back. Call ``recover()`` when the window
     really does need fronting.
+
+    ``unstick`` covers the state that has no dialog to find: an in-place edit on
+    the canvas, such as clicking a dimension's number after selecting an object,
+    which leaves a caret waiting for keystrokes. Chief then holds the input and
+    gestures are refused, with nothing in ``discover_open_dialogs`` to show for
+    it. Escape cancels that edit, and it can only be delivered while Chief owns
+    the keyboard, which is exactly when the state exists.
     """
     state = ensure_active() if activate else None
     data = await call(session, "chief_input_canvas_gesture", gestures=gestures)
     if state is not None and isinstance(data, dict):
         data["activation"] = state
+
+    if unstick and isinstance(data, dict) and not data.get("success"):
+        dialogs = await call(session, "chief_discover_open_dialogs")
+        if not (dialogs.get("trackedQuestion") or {}).get("active") and send_escape(steal=True):
+            retry = await call(session, "chief_input_canvas_gesture", gestures=gestures)
+            if isinstance(retry, dict):
+                retry["recovered_by"] = "Escape"
+                return retry
     return data
 
 
@@ -1365,6 +1406,12 @@ async def _main(args):
             print(f"foreground before : {before!r}")
             print(f"foreground after  : {state.get('foreground')!r}")
             print(f"active={state.get('active')} changed={state.get('changed')}")
+        elif args.cmd == "escape":
+            foreground = foreground_title()
+            sent = send_escape(steal=args.steal)
+            note = "" if sent else " (Chief does not have the keyboard; add --steal to grab it briefly)"
+            print(f"escape sent: {sent}{note}")
+            print(f"foreground : {foreground!r}")
         elif args.cmd == "recover":
             steps = await recover(s, keyboard=args.keyboard, focus=args.focus)
             if args.focus:
@@ -1429,6 +1476,9 @@ def main(argv=None):
     difference.add_argument("--out")
     bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     sub.add_parser("active", help="bring Chief to the front and report the foreground window")
+    esc = sub.add_parser("escape", help="cancel an in-place edit that is holding the keyboard")
+    esc.add_argument("--steal", action="store_true",
+                     help="front Chief briefly even if it is behind another window")
     rec = sub.add_parser("recover", help="clear a dialog or text edit that is holding the keyboard")
     rec.add_argument("--keyboard", action="store_true",
                      help="also tap Escape, for an in-place text edit with no dialog")
