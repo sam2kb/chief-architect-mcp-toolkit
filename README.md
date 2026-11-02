@@ -54,6 +54,14 @@ field across every match, planning first and writing only when you pass
 `apply=True`. Each object gets its own dialog, so count on about a second per
 object.
 
+Before a long run, `snapshot` writes the objects, rooms and front view to JSON.
+`diff` compares a saved snapshot against the current state and reports what
+moved, resized, appeared or vanished. `preflight` checks for an open modal, a
+changed front view, and objects that have shifted since capture;
+`apply_property` takes a snapshot and aborts rather than writing into a document
+that moved on. `clear_dialogs` cancels a stranded modal, which otherwise makes
+every gesture fail in a way that looks like a missed click.
+
 `call()` follows `reportFilename` automatically, so
 `await chief_mcp.objects(s)` returns the list rather than a path.
 
@@ -113,6 +121,9 @@ python chief_mcp.py metrics
 python chief_mcp.py find --name "hinged door"
 python chief_mcp.py fields <object-id>
 python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 80" --apply
+python chief_mcp.py snapshot
+python chief_mcp.py diff ~/.chief_mcp/snap-2026-11-01T190949.json
+python chief_mcp.py clear
 python chief_mcp.py views
 python chief_mcp.py docs "layer sets"
 python chief_mcp.py image out.png

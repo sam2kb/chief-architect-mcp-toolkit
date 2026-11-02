@@ -125,6 +125,48 @@ class MatchObjectsTests(unittest.TestCase):
         self.assertEqual([o["objectId"] for o in chief_mcp.match_objects(pool, name="light", floor=2)], ["l2"])
 
 
+class SnapshotTests(unittest.TestCase):
+    @staticmethod
+    def snap(objects):
+        return {"scope": "front-view", "front_view": "Plan", "objects": objects}
+
+    def test_fingerprint_ignores_dict_order(self):
+        a = make_object("Wall", 1, 2, 3, 4, oid="w1")
+        b = dict(reversed(list(make_object("Wall", 1, 2, 3, 4, oid="w1").items())))
+        self.assertEqual(chief_mcp.fingerprint([a]), chief_mcp.fingerprint([b]))
+
+    def test_fingerprint_changes_when_an_object_moves(self):
+        before = [make_object("Wall", 1, 2, 3, 4, oid="w1")]
+        after = [make_object("Wall", 1, 2.5, 3, 4, oid="w1")]
+        self.assertNotEqual(chief_mcp.fingerprint(before), chief_mcp.fingerprint(after))
+
+    def test_diff_detects_move(self):
+        before = self.snap([make_object("Door", 10, 10, 3, 7, oid="d1")])
+        after = self.snap([make_object("Door", 10.5, 10, 3, 7, oid="d1")])
+        result = chief_mcp.diff_snapshots(before, after)
+        self.assertEqual(result["counts"]["moved"], 1)
+        self.assertAlmostEqual(result["moved"][0]["dx"], 0.5)
+
+    def test_diff_detects_resize(self):
+        before = self.snap([make_object("Door", 10, 10, 3, 7, oid="d1")])
+        after = self.snap([make_object("Door", 10, 10, 3, 6.5, oid="d1")])
+        result = chief_mcp.diff_snapshots(before, after)
+        self.assertEqual(result["counts"]["resized"], 1)
+        self.assertAlmostEqual(result["resized"][0]["dd"], -0.5)
+
+    def test_diff_detects_add_and_remove(self):
+        before = self.snap([make_object("Door", 0, 0, 3, 7, oid="d1")])
+        after = self.snap([make_object("Window", 0, 0, 3, 4, oid="w9")])
+        result = chief_mcp.diff_snapshots(before, after)
+        self.assertEqual(result["counts"]["added"], 1)
+        self.assertEqual(result["counts"]["removed"], 1)
+
+    def test_diff_ignores_sub_tolerance_noise(self):
+        before = self.snap([make_object("Door", 10, 10, 3, 7, oid="d1")])
+        after = self.snap([make_object("Door", 10.001, 10, 3, 7, oid="d1")])
+        self.assertEqual(chief_mcp.diff_snapshots(before, after)["counts"]["moved"], 0)
+
+
 class PayloadMergeTests(unittest.TestCase):
     def test_report_is_merged_into_the_live_payload(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:

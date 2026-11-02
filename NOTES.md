@@ -38,6 +38,10 @@ server, which needs a Google API key and is not registered by default.
 
 ## Recipes that work
 
+0. **Before anything else** — `snapshot` the front view and run `clear_dialogs`.
+   Keep the snapshot file so a `diff` afterwards can prove what changed. A modal
+   left open refuses every later gesture, and the refusal looks exactly like a
+   click that missed.
 1. **Edit an object's numeric properties** — `doubleClick` a free point on the
    object, then in the Specification dialog write the field and press OK.
    Position fields live on the General panel (`boxID_XPos`, `boxID_YPos`).

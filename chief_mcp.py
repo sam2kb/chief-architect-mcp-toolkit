@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -245,6 +247,24 @@ async def press(session, choice, label, question=None):
         session, "chief_click_dialog_button",
         choiceId=choice, label=label, questionId=question,
     )
+
+
+async def clear_dialogs(session):
+    """Cancel any agent-tracked dialog left open; returns its title or None.
+
+    A stuck modal refuses every canvas gesture, and the refusal looks like a
+    click that hit nothing. Call this before a run and after a crash.
+    """
+    info = await call(session, "chief_discover_open_dialogs")
+    tracked = info.get("trackedQuestion") or {}
+    if not tracked.get("active"):
+        return None
+    title = tracked.get("title")
+    try:
+        await press(session, "1", "Cancel", tracked.get("questionId"))
+    except Exception:  # noqa: BLE001
+        pass
+    return title
 
 
 # --------------------------------------------------------------------------
@@ -617,13 +637,24 @@ async def describe_fields(session, object_id, objects_list=None, panel=None):
 
 
 async def apply_property(session, targets, field_id, value=None, option=None, panel=None,
-                         apply=False, limit=None, on_error="stop"):
+                         apply=False, limit=None, on_error="stop", expect=None,
+                         snapshot=None):
     """Write one dialog field on every target object.
 
     A multi-object dialog edits only the object you double-clicked, so the only
     way to change many objects is one dialog each. Returns a per-object report;
     nothing is written until ``apply`` is true.
+
+    Pass ``expect`` with a word from the dialog title ("Door", "Room") so a
+    click that lands on a neighbouring object is rejected instead of edited.
+    Pass ``snapshot`` to abort the whole run when the document has moved on.
     """
+    if snapshot is not None:
+        check = await preflight(session, snapshot, [o["objectId"] for o in targets])
+        if not check["ok"]:
+            return {"applied": False, "aborted": True, "problems": check["problems"],
+                    "count": len(targets), "results": []}
+
     objects_list = await objects(session)
     chosen = list(targets)
     if limit:
@@ -638,7 +669,7 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
 
         try:
             dialog = await open_spec(session, bbox(obj), objects_list,
-                                     skip_ids=[obj["objectId"]])
+                                     skip_ids=[obj["objectId"]], expect=expect)
         except RuntimeError as exc:
             results.append({**entry, "error": str(exc)})
             if on_error == "stop":
@@ -670,6 +701,126 @@ async def _cancel(session, question):
         await press(session, "1", "Cancel", question)
     except Exception:  # noqa: BLE001
         pass
+
+
+# --------------------------------------------------------------------------
+# snapshots and preflight
+# --------------------------------------------------------------------------
+SNAPSHOT_DIR = Path(os.environ.get(
+    "CAMCP_SNAPSHOT_DIR", str(Path.home() / ".chief_mcp")
+))
+
+
+def _canonical(obj):
+    """The parts of an object that matter when comparing snapshots."""
+    return {
+        "id": obj.get("objectId"),
+        "name": obj.get("name"),
+        "layer": obj.get("layer"),
+        "x": round(obj["location"]["x"], 3),
+        "y": round(obj["location"]["y"], 3),
+        "w": round(obj["size"]["width"], 3),
+        "d": round(obj["size"]["depth"], 3),
+    }
+
+
+def fingerprint(objects_list) -> str:
+    """Short hash of object positions and sizes, for spotting drift."""
+    payload = json.dumps([_canonical(o) for o in objects_list], sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+async def snapshot(session, entire=False, path=None):
+    """Capture objects, rooms and the front view into a JSON file.
+
+    ``scope`` records which listing produced it: the front view and the whole
+    document return different objects, and the entire-document listing omits
+    ``layoutPage``, so snapshots from the two modes are not interchangeable.
+    """
+    object_list = await objects(session, entire=entire)
+    room_list = await rooms(session)
+    front = next((v for v in await views(session) if v.get("front")), {})
+
+    data = {
+        "captured": datetime.now().isoformat(timespec="seconds"),
+        "scope": "entire-document" if entire else "front-view",
+        "front_view": front.get("viewTitle"),
+        "fingerprint": fingerprint(object_list),
+        "objects": object_list,
+        "rooms": room_list,
+    }
+
+    target = Path(path) if path else SNAPSHOT_DIR / f"snap-{data['captured'].replace(':', '')}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    return {"path": str(target), "count": len(object_list),
+            "scope": data["scope"], "fingerprint": data["fingerprint"]}
+
+
+def diff_snapshots(before, after, tolerance=0.01):
+    """Compare two snapshots. Returns added, removed, moved and resized."""
+    old = {o["objectId"]: o for o in before.get("objects", [])}
+    new = {o["objectId"]: o for o in after.get("objects", [])}
+
+    moved, resized = [], []
+    for oid in old.keys() & new.keys():
+        was, now = _canonical(old[oid]), _canonical(new[oid])
+        if abs(was["x"] - now["x"]) > tolerance or abs(was["y"] - now["y"]) > tolerance:
+            moved.append({"objectId": oid, "name": now["name"],
+                          "dx": round(now["x"] - was["x"], 3),
+                          "dy": round(now["y"] - was["y"], 3)})
+        if abs(was["w"] - now["w"]) > tolerance or abs(was["d"] - now["d"]) > tolerance:
+            resized.append({"objectId": oid, "name": now["name"],
+                            "dw": round(now["w"] - was["w"], 3),
+                            "dd": round(now["d"] - was["d"], 3)})
+
+    return {
+        "added": [new[i] for i in new.keys() - old.keys()],
+        "removed": [old[i] for i in old.keys() - new.keys()],
+        "moved": moved,
+        "resized": resized,
+        "counts": {"added": len(new.keys() - old.keys()), "removed": len(old.keys() - new.keys()),
+                   "moved": len(moved), "resized": len(resized)},
+    }
+
+
+async def preflight(session, snap, object_ids=None, tolerance=0.01):
+    """Refuse to continue if the application no longer matches a snapshot.
+
+    Checks that no modal is open, that the front view is the one captured, and
+    that each named object still exists on the same layer in the same place.
+    """
+    problems = []
+
+    info = await call(session, "chief_discover_open_dialogs")
+    tracked = info.get("trackedQuestion") or {}
+    if tracked.get("active"):
+        problems.append(f"modal dialog is open: {tracked.get('title')!r}")
+
+    front = next((v for v in await views(session) if v.get("front")), {})
+    expected = snap.get("front_view")
+    if expected and front.get("viewTitle") != expected:
+        problems.append(
+            f"front view changed: snapshot has {expected!r}, now {front.get('viewTitle')!r}"
+        )
+
+    if object_ids:
+        captured = {o["objectId"]: o for o in snap.get("objects", [])}
+        live = {o["objectId"]: o for o in await objects(session)}
+        for oid in object_ids:
+            was, now = captured.get(oid), live.get(oid)
+            if was is None:
+                problems.append(f"{oid}: not in the snapshot")
+            elif now is None:
+                problems.append(f"{oid}: no longer in the front view")
+            else:
+                a, b = _canonical(was), _canonical(now)
+                if a["layer"] != b["layer"]:
+                    problems.append(f"{oid}: layer changed since the snapshot")
+                elif abs(a["x"] - b["x"]) > tolerance or abs(a["y"] - b["y"]) > tolerance:
+                    problems.append(f"{oid}: moved since the snapshot")
+
+    return {"ok": not problems, "problems": problems}
 
 
 # --------------------------------------------------------------------------
@@ -823,13 +974,37 @@ async def _main(args):
                 return
             report = await apply_property(s, targets, args.field, value=args.value,
                                           option=args.option, panel=args.panel,
-                                          apply=args.apply, limit=args.limit)
+                                          apply=args.apply, limit=args.limit,
+                                          expect=args.expect, snapshot=args.snapshot_data)
             done = sum(1 for r in report["results"] if r.get("ok") or r.get("planned"))
             state = "applied" if report["applied"] else "planned"
             print(f"{state}: {done}/{report['count']}")
             for result in report["results"]:
                 if result.get("error"):
                     print(f"  ERROR {result.get('name')}: {result['error']}")
+        elif args.cmd == "clear":
+            title = await clear_dialogs(s)
+            print(f"cancelled {title!r}" if title else "no dialog open")
+        elif args.cmd == "snapshot":
+            info = await snapshot(s, entire=args.entire, path=args.out)
+            print(f"saved {info['count']} object(s) from the {info['scope']} "
+                  f"to {info['path']}")
+            print(f"fingerprint {info['fingerprint']}")
+        elif args.cmd == "diff":
+            before = json.loads(Path(args.before).read_text(encoding="utf-8"))
+            after = await snapshot(s, entire=(before.get("scope") == "entire-document"),
+                                   path=args.out)
+            after_data = json.loads(Path(after["path"]).read_text(encoding="utf-8"))
+            result = diff_snapshots(before, after_data)
+            print(json.dumps(result["counts"]))
+            for item in result["moved"]:
+                print(f"  moved   {str(item['name']):<18} {item['objectId'][:8]}  "
+                      f"dx={item['dx']} dy={item['dy']}")
+            for item in result["resized"]:
+                print(f"  resized {str(item['name']):<18} {item['objectId'][:8]}  "
+                      f"dw={item['dw']} dd={item['dd']}")
+            for item in result["removed"]:
+                print(f"  removed {str(item['name']):<18} {str(item.get('objectId'))[:8]}")
         elif args.cmd == "views":
             for v in await views(s):
                 front = "*" if v.get("front") else " "
@@ -874,6 +1049,15 @@ def main(argv=None):
     bulk.add_argument("--option", type=int, help="option id for a combo field")
     bulk.add_argument("--panel")
     bulk.add_argument("--limit", type=int)
+    bulk.add_argument("--expect", help="require this word in the dialog title, e.g. Door")
+    bulk.add_argument("--snapshot", help="abort unless the document still matches this snapshot")
+    sub.add_parser("clear", help="cancel a stuck dialog")
+    snap = sub.add_parser("snapshot", help="save objects, rooms and front view to JSON")
+    snap.add_argument("--entire", action="store_true", help="whole document, not just the front view")
+    snap.add_argument("--out")
+    difference = sub.add_parser("diff", help="compare a saved snapshot with the current state")
+    difference.add_argument("before")
+    difference.add_argument("--out")
     bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     sub.add_parser("views", help="open views")
     doc = sub.add_parser("docs", help="search Chief's help")
@@ -882,6 +1066,11 @@ def main(argv=None):
     img = sub.add_parser("image", help="export front view to PNG")
     img.add_argument("path")
     args = parser.parse_args(argv)
+    snapshot_file = getattr(args, "snapshot", None)
+    args.snapshot_data = (
+        json.loads(Path(snapshot_file).read_text(encoding="utf-8"))
+        if snapshot_file else None
+    )
     try:
         asyncio.run(_main(args))
     except KeyboardInterrupt:
