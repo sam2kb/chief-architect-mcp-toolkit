@@ -13,7 +13,7 @@ treating them as permanent.
 |---|---|
 | Server source | `<install>/resources/camcp/src` (Python, src layout) |
 | Launch | `python -m camcp.chief.server` with `PYTHONPATH` pointing at that `src` |
-| Dependencies | `mcp[cli]` 2.x, `psutil` |
+| Dependencies | `mcp[cli]` 2.x, `psutil` (the server imports `psutil`, so it must be in whichever interpreter launches it) |
 | Transport | stdio; relays to Chief over `\\.\pipe\chief-architect-mcp-28` |
 | Tool cache | `%LOCALAPPDATA%` (Windows) under the server's own directory |
 
@@ -31,6 +31,8 @@ server, which needs a Google API key and is not registered by default.
 | Export view to PDF / image / DWG | works |
 | Search bundled help docs | works |
 | Pointer click, double-click, scroll | works |
+| Tab, to cycle the selection through stacked objects | works, when sent as a real keystroke |
+| Escape, to cancel an in-place edit | works as a real keystroke; not reachable over MCP |
 | Drag to move an object | **no-op** |
 | `invoke_command`, `input_hotkey`, `open_document`, project browser | refused: needs project management mode (this build) |
 | Layout page navigation | unavailable (the relevant command is gated) |
@@ -42,11 +44,14 @@ server, which needs a Google API key and is not registered by default.
    Keep the snapshot file so a `diff` afterwards can prove what changed. A dialog
    left open refuses every later gesture, and the refusal looks exactly like a
    click that missed.
-1. **Edit an object's numeric properties** — `doubleClick` a free point on the
-   object, then in the Specification dialog write the field and press OK.
-   Position fields live on the General panel (`boxID_XPos`, `boxID_YPos`).
+1. **Edit an object's numeric properties** — open its Specification with
+   `open_spec_anywhere`, write the field, press OK. Position fields live on the
+   General panel (`boxID_XPos`, `boxID_YPos`). Do not double-click a guessed
+   point: if it lands on a dimension number, Chief starts an in-place edit and
+   holds the keyboard until something cancels it.
 2. **Rename rooms** — room labels are generated from `roomID_RoomName`, so
-   renaming the room changes the label. `doubleClick` the interior first.
+   renaming the room changes the label. Rooms have no object dict to hit-test,
+   so they still go through `open_spec`, which guesses points inside the bounds.
 3. **Fill behind a text object** — Text Specification → panel `Fill Style` →
    press `attrID_PatternColor` → in *Select Color* write `ColorShower_Hex`
    (`#FFFF00`) → OK → OK.

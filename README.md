@@ -59,17 +59,24 @@ which is what Windows requires before it will grant the foreground — and
 `python chief_mcp.py active` runs the same thing from a shell.
 
 Dialogs (the reliable way to edit anything): `dialog_fields`, `find_node`,
-`node_value`, `set_field`, `press`.
+`node_value`, `set_field`, `press`, `clear_dialogs`.
 
-Geometry: `bbox`, `left`, `width`, `contains`, `free_point`, `fmt_inches`,
-`parse_inches`.
+Geometry: `bbox`, `left`, `width`, `contains`, `free_point`, `scan_points`,
+`fmt_inches`, `parse_inches`.
 
 Recipes, each of which opens a Specification dialog, writes the value, and
-confirms it: `open_spec`, `move_object`, `rename_room`, `set_text_fill`.
-These exist because the dialogs are the only edit path that reliably commits.
-They go through `spec_dialog`, a context manager that cancels the dialog if the
-body raises: a dialog left open holds the keyboard and refuses every later
-gesture, with no timeout.
+confirms it: `open_spec`, `open_spec_anywhere`, `move_object`, `rename_room`,
+`set_text_fill`. These exist because the dialogs are the only edit path that
+reliably commits. They go through `spec_dialog`, a context manager that cancels
+the dialog if the body raises: a dialog left open holds the keyboard and refuses
+every later gesture, with no timeout.
+
+`open_spec` double-clicks candidate points blind, which is what starts an
+in-place dimension edit when a guess lands on a dimension number. When you have
+the object dict, use `open_spec_anywhere` instead: it clicks once, reads the
+selection back to prove the point hits the object, and only then double-clicks.
+`reachable_point` and `hit_point` are the pieces, the latter scanning the bounds
+for a point that selects a covered object.
 
 When one is already stuck, `recover()` cancels the tracked dialog, force-closes
 anything left on top, and reports whether a dialog is still open. Nothing in this
@@ -89,6 +96,14 @@ the same keystroke by hand.
 Set `CAMCP_TRACE=1` (and optionally `CAMCP_TRACE_FILE`) to append a line per MCP
 call to `~/.chief_mcp/trace.jsonl`. A hang shows up as a `call` with no matching
 `done`, which distinguishes "Chief is busy" from "the agent stopped talking".
+
+Keyboard helpers, for the states MCP cannot reach. `send_key` and `send_escape`
+deliver Escape (cancel an in-place edit) and Tab (cycle the selection through
+stacked objects) — the only two keys allowed, with Delete and the edit commands
+left refused on purpose. Without `steal=True` they refuse unless Chief already
+has the foreground; with it, Chief is fronted for the keystroke and the previous
+window is put back. `settle` finishes a run cleanly: cancel the dialog, tap
+Escape, clear the selection, report whether a dialog is still open.
 
 Reading the model: `audit` checks the front view for unnamed rooms, zero-size
 objects, text on the wrong layer, locked layers, and exact duplicates.
@@ -124,7 +139,10 @@ Note the module is `chief_mcp`, not `camcp`: naming it `camcp` would shadow the
 
 - Chief Architect Premier X18 with **Enable Chief MCP Server** on
   (Preferences → General → Agentic AI), and the application running.
-- Python 3.10+ with the `mcp` package installed.
+- Python 3.10+ with the `mcp` package installed. `psutil` is in
+  `requirements.txt` because the bundled server imports it — it has to be
+  installed in whichever interpreter launches the server, which is usually this
+  same one.
 - Python 3.12 if you use the type syntax as written.
 
 ## Setup
@@ -172,10 +190,15 @@ python chief_mcp.py audit
 python chief_mcp.py metrics
 python chief_mcp.py find --name "hinged door"
 python chief_mcp.py fields <object-id>
-python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 80" --apply
+python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 80" --expect Door
+python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 84" --expect Door --apply
 python chief_mcp.py snapshot
 python chief_mcp.py diff ~/.chief_mcp/snap-2026-11-01T190949.json
-python chief_mcp.py clear
+python chief_mcp.py clear          # cancel a stranded dialog
+python chief_mcp.py settle         # cancel, Escape, clear the selection: ready for a person
+python chief_mcp.py recover        # cancel dialogs, report what is left
+python chief_mcp.py escape --steal # cancel an in-place edit holding the keyboard
+python chief_mcp.py active         # front Chief, deliberately, and say where focus went
 python chief_mcp.py views
 python chief_mcp.py docs "layer sets"
 python chief_mcp.py image out.png
@@ -202,6 +225,10 @@ Read `NOTES.md` for the detail. What works and what does not:
 | Writing a field and pressing OK | works |
 | Selecting objects by id | works |
 | Exporting PDF, image, DWG | works |
+| Gestures while Chief is behind another window, or minimized | work; the window does not need the foreground |
+| Picking an object with something on top of it | works: Tab cycles the stack under the cursor; Ctrl+click does not |
+| An in-place edit (click a dimension number) | holds the keyboard indefinitely; only Escape clears it |
+| Bringing Chief to the front | works, but takes the keyboard; opt-in only |
 | Synthetic drags | do not commit; positions never change |
 | Text object contents | not exposed anywhere |
 | `invoke_command`, `input_hotkey`, `open_document`, project browser | refused |
@@ -214,8 +241,9 @@ python -m unittest discover -s tests -t .
 ```
 
 The unit tests are offline: inch formatting and parsing, bounding boxes,
-hit-point selection against overlapping obstacles, and `.env` loading. Run
-`selftest.py` for the live check -- it only reads, opening no dialogs.
+hit-point selection against overlapping obstacles, launch configuration,
+key handling against a fake `user32`, and dialog cleanup. Run `selftest.py` for
+the live check -- it only reads, opening no dialogs.
 
 ## License
 

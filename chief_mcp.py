@@ -7,10 +7,12 @@ load that report, and hand back plain Python.
 Requires a Python environment with the ``mcp`` package (the same one the MCP
 server itself runs under).
 
-CLI:
+CLI (``python chief_mcp.py --help`` lists them all):
     python chief_mcp.py rooms
     python chief_mcp.py objects --name Kitchen
     python chief_mcp.py views
+    python chief_mcp.py settle        # leave the app ready for a person to type
+    python chief_mcp.py escape --steal
 
 Library:
     import chief_mcp
@@ -78,7 +80,12 @@ def load_env(path: Path | None = None) -> None:
 
 
 def server_params() -> StdioServerParameters:
-    """Launch params: explicit CAMCP_PYTHON/CAMCP_CHIEF_SRC from .env, else mcp.json."""
+    """Launch params: explicit CAMCP_PYTHON/CAMCP_CHIEF_SRC, else the mcp.json entry.
+
+    The two environment variables win when both are present. Otherwise the
+    matching entry is read out of VS Code's ``mcp.json``, which is where the
+    agent itself launches the server from, so the paths live in one place.
+    """
     python = os.environ.get("CAMCP_PYTHON")
     chief_src = os.environ.get("CAMCP_CHIEF_SRC")
     if python and chief_src:
@@ -87,6 +94,28 @@ def server_params() -> StdioServerParameters:
         return StdioServerParameters(
             command=python, args=["-m", "camcp.chief.server"], env=env
         )
+
+    config_path = mcp_config_path()
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "set CAMCP_PYTHON and CAMCP_CHIEF_SRC, or make "
+            f"{config_path} readable: {exc}"
+        ) from exc
+
+    entry = (config.get("servers") or {}).get(SERVER_NAME)
+    if not isinstance(entry, dict) or not entry.get("command"):
+        raise RuntimeError(
+            f"{config_path} has no {SERVER_NAME!r} server with a command; "
+            "set CAMCP_PYTHON and CAMCP_CHIEF_SRC instead"
+        )
+
+    env = dict(os.environ)
+    env.update(entry.get("env") or {})
+    return StdioServerParameters(
+        command=entry["command"], args=list(entry.get("args") or []), env=env
+    )
 
 
 load_env()
@@ -166,12 +195,6 @@ async def call(session: ClientSession, tool: str, **arguments):
             "success": payload.get("success") if isinstance(payload, dict) else None,
             "seconds": round(time.monotonic() - started, 3)})
     return payload
-
-
-async def raw(session: ClientSession, tool: str, **arguments):
-    """Call a tool; return its raw text (no report following)."""
-    args = {k: v for k, v in arguments.items() if v is not None}
-    return _text(await session.call_tool(tool, args))
 
 
 # --------------------------------------------------------------------------
@@ -367,31 +390,6 @@ def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08,
 def send_escape(lib=None, presses: int = 1, delay: float = 0.08, steal: bool = False) -> bool:
     """Press Escape. Kept as a name because it reads better at call sites."""
     return send_key("Escape", lib=lib, presses=presses, delay=delay, steal=steal)
-
-
-async def cycle_selection(session, point, target_id, presses: int = 12):
-    """Click a point, then Tab through the objects stacked there until one matches.
-
-    Clicking selects whichever object is topmost, so a door with a marker on top
-    cannot be picked by position alone. Tab walks the stack under the cursor.
-    Returns the objectIds passed through, as evidence of what was actually there.
-    """
-    await select(session, [])
-    reply = await click(session, point[0], point[1])
-    if not isinstance(reply, dict) or not reply.get("success"):
-        return None, []
-    seen: list = []
-    for _ in range(presses):
-        selected = [s.get("objectId") for s in await selection(session)]
-        for object_id in selected:
-            if object_id not in seen:
-                seen.append(object_id)
-        if target_id in selected:
-            return point, seen
-        if not send_key("Tab"):
-            break
-        time.sleep(0.25)
-    return None, seen
 
 
 async def settle(session, escape: bool = True) -> dict:
@@ -688,12 +686,16 @@ def _candidate_points(bounds, objects, skip_ids=(), attempts=4):
 
 
 async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts=4):
-    """Double-click until a dialog opens, and return its payload.
+    """Double-click candidate points inside ``bounds`` until a dialog opens.
 
-    The first click can land on a dimension line running across the object, so
-    later attempts try other points inside the bounds. When ``expect`` is given,
-    a dialog whose title does not contain it is cancelled and the next point is
-    tried.
+    This is the blind path: nothing checks what is under the point before
+    clicking it, so a candidate can land on a dimension number and start an
+    in-place edit, which then holds the keyboard until something cancels it.
+    Prefer ``open_spec_anywhere``, which clicks once to prove the point first.
+    Use this when there is no object dict to hit-test, as for a room.
+
+    When ``expect`` is given, a dialog whose title does not contain it is
+    cancelled and the next point is tried.
     """
     wrong = None
     for x, y in _candidate_points(bounds, objects, skip_ids, attempts):
@@ -798,7 +800,7 @@ async def reachable_point(session, obj, steps: int = 7, presses: int = 8):
     return await hit_point(session, obj, steps=steps)
 
 
-async def open_spec_anywhere(session, obj, objects, expect=None, attempts=4, steps=7):
+async def open_spec_anywhere(session, obj, objects, expect=None, steps=7):
     """Open an object's Specification dialog on a point proven to hit the object.
 
     Double-clicking a guessed point is what starts an in-place edit when the guess
@@ -832,8 +834,7 @@ async def spec_dialog(session, bounds, objects, skip_ids=(), expect=None, attemp
     geometric hit point lands on something else.
     """
     if target is not None:
-        dialog = await open_spec_anywhere(session, target, objects, expect=expect,
-                                          attempts=attempts)
+        dialog = await open_spec_anywhere(session, target, objects, expect=expect)
     else:
         dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids,
                                  expect=expect, attempts=attempts)
@@ -1044,7 +1045,7 @@ async def describe_fields(session, object_id, objects_list=None, panel=None):
     if target is None:
         raise ValueError("that object is not in the front view")
 
-    dialog = await open_spec(session, bbox(target), objs, skip_ids=[object_id])
+    dialog = await open_spec_anywhere(session, target, objs)
     question = dialog.get("questionId")
     try:
         found = await dialog_fields(session, panel=panel)
@@ -1119,6 +1120,9 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
             if on_error == "stop":
                 break
 
+    if apply:
+        # one dialog per object leaves a lot of chances to strand a command
+        await settle(session)
     return {"applied": apply, "count": len(chosen), "results": results}
 
 
@@ -1438,6 +1442,12 @@ async def _main(args):
             print(f"foreground before : {before!r}")
             print(f"foreground after  : {state.get('foreground')!r}")
             print(f"active={state.get('active')} changed={state.get('changed')}")
+        elif args.cmd == "settle":
+            state = await settle(s, escape=not args.no_escape)
+            print(f"cancelled   : {state['cancelled']!r}")
+            print(f"escape sent : {state['escape']}")
+            print(f"selection   : {len(state['selection'])} object(s)")
+            print(f"dialog open : {state['dialog_open']}")
         elif args.cmd == "escape":
             foreground = foreground_title()
             sent = send_escape(steal=args.steal)
@@ -1497,16 +1507,18 @@ def main(argv=None):
     bulk.add_argument("--option", type=int, help="option id for a combo field")
     bulk.add_argument("--panel")
     bulk.add_argument("--limit", type=int)
+    bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     bulk.add_argument("--expect", help="require this word in the dialog title, e.g. Door")
     bulk.add_argument("--snapshot", help="abort unless the document still matches this snapshot")
     sub.add_parser("clear", help="cancel a stuck dialog")
+    stl = sub.add_parser("settle", help="cancel dialogs, tap Escape, clear the selection")
+    stl.add_argument("--no-escape", action="store_true", help="skip the keystroke")
     snap = sub.add_parser("snapshot", help="save objects, rooms and front view to JSON")
     snap.add_argument("--entire", action="store_true", help="whole document, not just the front view")
     snap.add_argument("--out")
     difference = sub.add_parser("diff", help="compare a saved snapshot with the current state")
     difference.add_argument("before")
     difference.add_argument("--out")
-    bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     sub.add_parser("active", help="bring Chief to the front and report the foreground window")
     esc = sub.add_parser("escape", help="cancel an in-place edit that is holding the keyboard")
     esc.add_argument("--steal", action="store_true",
