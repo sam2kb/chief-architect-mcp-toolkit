@@ -1612,6 +1612,10 @@ async def _main(args):
             for result in report["results"]:
                 if result.get("error"):
                     print(f"  ERROR {result.get('name')}: {result['error']}")
+                elif result.get("after") is not None:
+                    # the value the dialog reported after the write, which is the
+                    # cheapest verification: no second pass over the objects
+                    print(f"  {result.get('name')} {str(result.get('objectId'))[:8]} -> {result['after']}")
         elif args.cmd == "clear":
             title = await clear_dialogs(s)
             print(f"cancelled {title!r}" if title else "no dialog open")
