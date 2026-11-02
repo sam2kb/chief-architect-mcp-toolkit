@@ -107,6 +107,10 @@ class FreePointTests(unittest.TestCase):
         x, y = chief_mcp.free_point(self.bounds, [blocker], skip_ids=["abc"])
         self.assertEqual((round(x, 3), round(y, 3)), (50.0, 50.0))
 
+    def test_a_single_step_still_returns_a_point(self):
+        x, y = chief_mcp.free_point(self.bounds, [], steps=1)
+        self.assertTrue(chief_mcp.contains(self.bounds, x, y))
+
 
 class LoadEnvTests(unittest.TestCase):
     def test_never_overrides_existing_values(self):

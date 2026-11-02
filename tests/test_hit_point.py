@@ -46,6 +46,12 @@ class ScanPointTests(unittest.TestCase):
         distances = [((x - 5) ** 2 + (y - 5) ** 2) ** 0.5 for x, y in points]
         self.assertEqual(distances, sorted(distances))
 
+    def test_a_single_step_still_returns_points(self):
+        points = chief_mcp.scan_points(self.bounds, steps=1, inset=0.0)
+        self.assertTrue(points)
+        for x, y in points:
+            self.assertTrue(chief_mcp.contains(self.bounds, x, y))
+
 
 if __name__ == "__main__":
     unittest.main()

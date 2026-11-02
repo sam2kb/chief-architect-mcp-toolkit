@@ -73,6 +73,11 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
                                      timeout=0.05, recover=False)
         recovered.assert_not_awaited()
 
+    async def test_without_recovery_the_timeout_does_not_claim_the_app_was_nudged(self):
+        with self.assertRaises(chief_mcp.CallTimeout) as caught:
+            await chief_mcp.call(SlowSession(), "chief_search_docs", timeout=0.01, recover=False)
+        self.assertNotIn("nudged", str(caught.exception))
+
     async def test_a_zero_timeout_disables_the_watchdog(self):
         session = FastSession()
         payload = await chief_mcp.call(session, "chief_discover_all_objects", timeout=0)

@@ -112,7 +112,15 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
 
         log, _report = await self.run_apply(behaviour)
         self.assertGreaterEqual(log["settles"], 1, "a run should not leave the app mid-dialog")
+    async def test_a_second_failure_keeps_both_messages(self):
+        def behaviour(log, _obj):
+            raise RuntimeError(f"attempt {log['opens']} failed")
 
+        log, report = await self.run_apply(behaviour)
+        result = report["results"][0]
+        self.assertTrue(result.get("retried"))
+        self.assertIn("attempt 1", result["error"])
+        self.assertIn("attempt 2", result["retry_error"])
 
 if __name__ == "__main__":
     unittest.main()

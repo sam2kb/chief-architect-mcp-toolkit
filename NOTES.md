@@ -37,7 +37,7 @@ server, which needs a Google API key and is not registered by default.
 | Drag to move an object | **no-op** |
 | `invoke_command`, `input_hotkey`, `open_document`, project browser | refused: needs project management mode (this build) |
 | Layout page navigation | unavailable (the relevant command is gated) |
-| Read text object contents | impossible |
+| Read text object contents | absent from object properties; PDF text extraction is a workaround |
 
 ## Recipes that work
 
@@ -179,10 +179,13 @@ Three rules fell out of that:
   Loop per object.
 - **Position fields display rounded to 1/16" but store decimals.** Hitting an
   exact target may take two passes.
-- **Text content is never exposed.** Properties are metadata only; asking for
-  `text`/`contents`/`string`/`caption` returns nothing. The rich text editor
+- **Direct text access is limited.** Object properties expose formatting and
+  metadata; asking for `text`/`contents`/`string`/`caption` returns nothing. The rich text editor
   control inside the dialog reports `support: unsupported` and
-  `hasUnreadableContent: true`.
+  `hasUnreadableContent: true`. PDF export and text extraction can recover
+  rendered words, with spacing and reading-order artifacts. Extracted text is
+  not linked back to the original Chief object IDs and does not preserve the
+  original rich-text formatting or macro expressions.
 - **`discover_all_objects(entireDocument=True)` omits `layoutPage`.**
 - **The mcp 2.x client** uses `init.server_info`, not `init.serverInfo`.
 - **The front view can change underneath you** if the user switches tabs

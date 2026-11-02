@@ -21,14 +21,18 @@ work, and it has.** Read this before pointing it at anything you care about.
 - **The MCP surface is undocumented and unversioned.** Anything here can break
   on a Chief Architect update, a build number, a preference change, or a UI
   setting, without warning and without a deprecation period.
-- **It is incomplete and lightly tested.** Continuous testing is a handful of
-  unit tests against pure functions — nothing exercises the app itself. The
-  integration paths have been run on one machine, one build (`28.2.1.14`), with
-  Project Management off. Several are known to be flaky.
-- **The input layer is Win32 keystroke injection.** It sends real mouse and
-  keyboard events. A mis-aimed click lands on whatever is under it, in whatever
-  window has focus. Delete and other destructive hotkeys are refused by the
-  server by design, and that refusal is only as strong as this code's restraint.
+- **Integration coverage is limited.** The integration paths have been run on
+  one machine, one build (`28.2.1.14`), with Project Management off. Several are
+  known to be flaky.
+- **Leave the keyboard and mouse alone while the agent drives Chief.** During
+  clicks, dialog inspection, edits, or recovery, do not type, click, switch
+  windows, or change the active drawing or selection. Canvas gestures go through
+  Chief's MCP server, but keyboard recovery sends real Windows keystrokes and
+  can briefly bring Chief to the foreground. Your input can race those actions,
+  dismiss a dialog, or send a key to the wrong window. Wait until the agent says
+  it has finished before taking over. Pure data reads normally need no keyboard
+  focus, but changing the drawing or view during a read can still change the
+  result. Delete and other destructive hotkeys remain refused by design.
 - **Identifiers, coordinates and viewport state go stale** the moment anyone
   touches the file. A stale object id or a stale point edits the wrong thing.
 - **Not affiliated with, endorsed by, or supported by Chief Architect.** No
@@ -41,6 +45,7 @@ If that is not what you want, stop here.
 | File | Purpose |
 |---|---|
 | `chief_mcp.py` | Async helpers + CLI over the MCP tools |
+| `chief_bridge.py` | Optional adapter for native error flags and raw reply tracing |
 | `instruction-set.md` | Guardrails to paste into an agent's rules file |
 | `selftest.py` | Read-only smoke test: connect, list views/rooms, pick a hit point |
 | `NOTES.md` | Field notes: capability matrix, working recipes, pitfalls |
@@ -50,7 +55,8 @@ If that is not what you want, stop here.
 Reads: `objects`, `properties`, `rooms`, `selection`, `views`, `commands`,
 `docs`, `status`.
 
-Input: `select`, `click`, `dblclick`, `export_image`, `export_pdf`. Clicks go
+Input: `select`, `select_matching`, `click`, `dblclick`, `export_image`,
+`export_pdf`, `export_view`. Clicks go
 through `gesture`, which does *not* front the window first: a click brings Chief
 forward on its own, and forcing activation takes the keyboard from whatever the
 user is typing into, which reads as the app hanging until they click back.
@@ -79,11 +85,11 @@ selection back to prove the point hits the object, and only then double-clicks.
 for a point that selects a covered object.
 
 When one is already stuck, `recover()` cancels the tracked dialog, force-closes
-anything left on top, and reports whether a dialog is still open. Nothing in this
-module takes the foreground on its own: doing so steals the keyboard from
-whatever you are typing into, and the ALT tap Windows requires can leave a menu
-grabbed in the window that had focus. `recover(focus=True)` and
-`python chief_mcp.py active` are the deliberate exceptions.
+anything left on top, and reports whether a dialog is still open. Normal gesture
+calls skip forced activation, but keyboard cleanup, timeout recovery, and retries
+can briefly bring Chief forward. The ALT tap used for activation can also leave
+a menu grabbed in the window that had focus. `recover(focus=True)` and
+`python chief_mcp.py active` explicitly request activation.
 `recover(keyboard=True)` taps Escape, which clears an in-place text edit that has
 no dialog to inspect.
 
@@ -97,18 +103,20 @@ Set `CAMCP_TRACE=1` (and optionally `CAMCP_TRACE_FILE`) to append a line per MCP
 call to `~/.chief_mcp/trace.jsonl`. A hang shows up as a `call` with no matching
 `done`, which distinguishes "Chief is busy" from "the agent stopped talking".
 
-Every call runs under a watchdog (`CAMCP_CALL_TIMEOUT`, default 2 seconds; exports
-get 60). These tools do not fail fast — a dialog tool with no tracked dialog waits
-for one that never arrives — so overrunning the deadline aborts the call, closes
-the top-most modal, taps Escape, and raises `CallTimeout`. The CLI reports it and
-exits with status 2; `python chief_mcp.py --timeout 5 <command>` overrides the
-deadline, and `--timeout 0` disables it. After a trip the session may be wedged,
-so `settle` or a restart is the next step.
+Calls run under a watchdog (`CAMCP_CALL_TIMEOUT`, default 2 seconds). Dialog
+calls get 15 seconds; exports and help searches get 60. Help search needs time
+to index the bundled documentation on its first run. An overrun raises
+`CallTimeout`; calls that allow UI recovery also try to close the top-most modal
+and tap Escape. Help search skips UI recovery. The CLI exits with status 2;
+`python chief_mcp.py --timeout 5 <command>` overrides the default deadline, and
+`--timeout 0` disables that default watchdog. The separate dialog, export, and
+help-search deadlines still apply. After a UI call times out, `settle` or a
+restart may be needed.
 
 Keyboard helpers, for the states MCP cannot reach. `send_key` and `send_escape`
-deliver Escape (cancel an in-place edit) and Tab (cycle the selection through
-stacked objects) — the only two keys allowed, with Delete and the edit commands
-left refused on purpose. Without `steal=True` they refuse unless Chief already
+include Escape (cancel an in-place edit) and Tab (cycle the selection through
+stacked objects). Keys are restricted to an allowlist; Delete remains refused.
+Without `steal=True` they refuse unless Chief already
 has the foreground; with it, Chief is fronted for the keystroke and the previous
 window is put back. `settle` finishes a run cleanly: cancel the dialog, tap
 Escape, clear the selection, report whether a dialog is still open.
@@ -132,6 +140,26 @@ retried once after settling, since most failures are a stale modal rather than
 the object; `--on-error continue` keeps the rest of the batch going, and
 `--selected` takes the targets from the current selection when an object cannot
 be matched by name or reached by clicking.
+
+`select` filters by name, layer, or floor and reads the selection back to verify
+the object IDs. It requires at least one filter. If nothing matches, it leaves
+the current selection alone; `select --clear` clears it explicitly. `--exact`
+uses case-sensitive whole-string matching; ordinary name and layer filters
+ignore case. Selection does not pan the view or navigate to another layout page.
+
+`fields --selected` inspects exactly one selected object. An empty or multiple
+selection is rejected before a dialog opens. The object must be reachable on
+the current view or layout page. `--all-panels` reads every listed
+panel during one opening, then cancels the dialog. `--contains` filters field
+IDs and labels without regard to case. `--options` shows dropdown and other
+option choices as IDs and labels, including disabled choices and long lists
+loaded from the tool's report file. Use the panel, field ID, and option ID with
+`apply --panel ... --field ... --option ...`; inspect again before writing if
+the dialog state has changed, since option IDs can shift.
+
+`export --type image|pdf|dwg2d <path>` exports the front view. The type is
+required; use a matching `.png`, `.pdf`, or `.dwg` filename. `image <path>`
+continues to work as the PNG shortcut.
 
 Before a long run, `snapshot` writes the objects, rooms and front view to JSON.
 `diff` compares a saved snapshot against the current state and reports what
@@ -174,6 +202,8 @@ cp .env.example .env        # then edit .env
 | `CAMCP_CHIEF_SRC` | `<Chief install>/resources/camcp/src` |
 | `CAMCP_SERVER` | Server key in `mcp.json` (default `ca-mcp-x18`) |
 | `CAMCP_MCP_JSON` | Optional explicit path to VS Code's `mcp.json` |
+| `CAMCP_BRIDGE` | Set to `1` to launch the local bridge adapter |
+| `CAMCP_BRIDGE_TRACE_FILE` | Optional private JSONL log of original bridge replies; requires the adapter |
 
 If `CAMCP_PYTHON` and `CAMCP_CHIEF_SRC` are both set, the helpers launch the
 server directly. Otherwise they read the matching entry out of your VS Code
@@ -192,6 +222,20 @@ server directly. Otherwise they read the matching entry out of your VS Code
 }
 ```
 
+To experiment with the bridge, set `CAMCP_BRIDGE=1` in `.env`. The helpers then
+launch `chief_bridge.py`, which imports the installed vendor package and uses
+its tool registry. Native replies containing `success: false`, and static
+`failed:` replies, are marked as MCP errors. Their content is preserved.
+The installed Chief files remain unchanged. This option requires the native
+`-m camcp.chief.server` launch configuration shown above, or the explicit
+`CAMCP_PYTHON` and `CAMCP_CHIEF_SRC` settings.
+
+Set `CAMCP_BRIDGE_TRACE_FILE` to a private path to capture original replies and
+the resulting error flags. These logs can contain drawing text and properties;
+keep them out of source control. Chief continues to enforce its native
+capabilities, including Project Management requirements and which dialog
+controls can be read. Set `CAMCP_BRIDGE=0` to return to the original bridge.
+
 ## Usage
 
 ```bash
@@ -201,7 +245,12 @@ python chief_mcp.py objects --entire
 python chief_mcp.py audit
 python chief_mcp.py metrics
 python chief_mcp.py find --name "hinged door"
+python chief_mcp.py select --name "hinged door" --layer Doors --floor 1
+python chief_mcp.py select --clear
 python chief_mcp.py fields <object-id>
+# With exactly one object selected in Chief:
+python chief_mcp.py fields --selected --all-panels --contains height
+python chief_mcp.py fields --selected --all-panels --options
 python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 80" --expect Door
 python chief_mcp.py apply --name "hinged door" --field doorID_Height --value 84" --expect Door --apply
 python chief_mcp.py apply --selected --field roomID_CeilingElevation --value '120"' --panel Structure --expect Room --apply
@@ -215,6 +264,9 @@ python chief_mcp.py active         # front Chief, deliberately, and say where fo
 python chief_mcp.py views
 python chief_mcp.py docs "layer sets"
 python chief_mcp.py image out.png
+python chief_mcp.py export --type image out.png
+python chief_mcp.py export --type pdf out.pdf
+python chief_mcp.py export --type dwg2d out.dwg
 ```
 
 ```python
@@ -242,9 +294,9 @@ Read `NOTES.md` for the detail. What works and what does not:
 | Picking an object with something on top of it | works: Tab cycles the stack under the cursor; Ctrl+click does not |
 | An in-place edit (click a dimension number) | holds the keyboard indefinitely; only Escape clears it |
 | Ctrl+E on a selection | opens the specification, but untracked: it can only be closed |
-| Bringing Chief to the front | works, but takes the keyboard; opt-in only |
+| Bringing Chief to the front | takes the keyboard; recovery and cleanup may do this briefly |
 | Synthetic drags | do not commit; positions never change |
-| Text object contents | not exposed anywhere |
+| Text object contents | absent from object properties; Rich Text editor is unreadable through MCP; PDF text extraction is a workaround |
 | `invoke_command`, `input_hotkey`, `open_document`, project browser | refused |
 | Delete, by any route | refused by design |
 

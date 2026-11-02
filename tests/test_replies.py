@@ -7,6 +7,7 @@ having `.get` rather than saying the app is not running.
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -39,6 +40,30 @@ class ExpectListTests(unittest.TestCase):
     def test_a_reply_missing_the_key_is_still_an_error(self):
         with self.assertRaises(RuntimeError):
             chief_mcp._expect_list({"success": True}, "objects", "tool")
+
+
+class DocsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_hit_list_comes_back(self):
+        hits = [{"topicPath": "t/1", "title": "Wall", "score": 1.5}]
+        with mock.patch.object(chief_mcp, "call", mock.AsyncMock(return_value=hits)) as called:
+            self.assertEqual(await chief_mcp.docs(None, "wall"), hits)
+        called.assert_awaited_once_with(None, "chief_search_docs", query="wall", maxResults=5,
+                                       timeout=chief_mcp.DOCS_TIMEOUT, recover=False)
+
+    async def test_invalid_dialog_panels_raise_instead_of_returning_empty_fields(self):
+        for reply in ({"success": False, "message": "panel not found"}, "failed: no dialog"):
+            with self.subTest(reply=reply):
+                with mock.patch.object(chief_mcp, "call", mock.AsyncMock(return_value=reply)):
+                    with self.assertRaisesRegex(RuntimeError, "panel not found|no dialog"):
+                        await chief_mcp.dialog_fields(None, panel="missing")
+
+    async def test_error_text_is_raised_not_handed_back_as_hits(self):
+        # this is what chief_search_docs answers with when it fails: plain text
+        with mock.patch.object(chief_mcp, "call",
+                               mock.AsyncMock(return_value="failed: no help directory")):
+            with self.assertRaises(RuntimeError) as caught:
+                await chief_mcp.docs(None, "wall")
+        self.assertIn("failed: no help directory", str(caught.exception))
 
 
 if __name__ == "__main__":

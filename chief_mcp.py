@@ -31,6 +31,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -79,6 +80,16 @@ def load_env(path: Path | None = None) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+def _server_args(arguments):
+    """Opt into our local bridge without changing the installed vendor files."""
+    if os.environ.get("CAMCP_BRIDGE") != "1":
+        return arguments
+    if arguments != ["-m", "camcp.chief.server"]:
+        raise RuntimeError("CAMCP_BRIDGE=1 requires the native -m camcp.chief.server launch; "
+                           "use CAMCP_PYTHON and CAMCP_CHIEF_SRC for a custom configuration")
+    return [str(REPO_ROOT / "chief_bridge.py")]
+
+
 def server_params() -> StdioServerParameters:
     """Launch params: explicit CAMCP_PYTHON/CAMCP_CHIEF_SRC, else the mcp.json entry.
 
@@ -92,7 +103,7 @@ def server_params() -> StdioServerParameters:
         env = dict(os.environ)
         env["PYTHONPATH"] = chief_src
         return StdioServerParameters(
-            command=python, args=["-m", "camcp.chief.server"], env=env
+            command=python, args=_server_args(["-m", "camcp.chief.server"]), env=env
         )
 
     config_path = mcp_config_path()
@@ -114,7 +125,7 @@ def server_params() -> StdioServerParameters:
     env = dict(os.environ)
     env.update(entry.get("env") or {})
     return StdioServerParameters(
-        command=entry["command"], args=list(entry.get("args") or []), env=env
+        command=entry["command"], args=_server_args(list(entry.get("args") or [])), env=env
     )
 
 
@@ -130,6 +141,7 @@ DIALOG_TIMEOUT = 15.0
 # couple of seconds without an answer means the app is not going to give one.
 CALL_TIMEOUT = 2.0
 EXPORT_TIMEOUT = 60.0
+DOCS_TIMEOUT = 60.0  # Cold searches build an index of the bundled help files.
 
 
 def call_timeout() -> float:
@@ -141,12 +153,12 @@ def call_timeout() -> float:
 
 
 class CallTimeout(RuntimeError):
-    """An MCP call overran the watchdog. Recovery has already been attempted."""
+    """An MCP call overran the watchdog."""
 
-    def __init__(self, tool: str, seconds: float):
+    def __init__(self, tool: str, seconds: float, recovery_attempted: bool = True):
+        recovery = " and the app was nudged back to a usable state" if recovery_attempted else ""
         super().__init__(
-            f"{tool} did not answer within {seconds:g}s, so it was aborted and the app "
-            "was nudged back to a usable state"
+            f"{tool} did not answer within {seconds:g}s, so it was aborted{recovery}"
         )
         self.tool = tool
         self.seconds = seconds
@@ -232,7 +244,7 @@ async def call(session: ClientSession, tool: str, timeout=None, recover=True, **
         _trace({"event": "timeout", "tool": tool, "seconds": seconds})
         if recover:
             await recover_after_timeout(session)
-        raise CallTimeout(tool, seconds) from None
+        raise CallTimeout(tool, seconds, recovery_attempted=recover) from None
     except BaseException as exc:
         _trace({"event": "raise", "tool": tool, "error": repr(exc),
                 "seconds": round(time.monotonic() - started, 3)})
@@ -253,9 +265,9 @@ async def recover_after_timeout(session, budget: float = 1.5) -> list:
     """
     steps: list = []
     try:
-        await asyncio.wait_for(
-            call(session, "chief_force_close_dialog", timeout=budget, recover=False), budget
-        )
+        # the call carries its own deadline; a second wait_for over it would race
+        # the same instant and could cancel the close mid-flight
+        await call(session, "chief_force_close_dialog", timeout=budget, recover=False)
         steps.append("force_close")
     except Exception:  # noqa: BLE001
         pass
@@ -328,7 +340,11 @@ async def commands(session):
 
 
 async def docs(session, query: str, limit: int = 5):
-    return await call(session, "chief_search_docs", query=query, maxResults=limit)
+    # the tool answers with a bare list, or with plain error text like
+    # "failed: ..." -- which must not come back as if it were hits
+    data = await call(session, "chief_search_docs", query=query, maxResults=limit,
+                      timeout=DOCS_TIMEOUT, recover=False)
+    return _expect_list(data, "results", "chief_search_docs")
 
 
 async def status(session):
@@ -554,6 +570,9 @@ async def recover(session, keyboard: bool = False, focus: bool = False) -> dict:
 # --------------------------------------------------------------------------
 async def select(session, object_ids):
     data = await call(session, "chief_select_objects", objectIds=list(object_ids))
+    if not isinstance(data, dict) or data.get("success") is False:
+        reason = data.get("message") if isinstance(data, dict) else data
+        raise RuntimeError(reason or "object selection failed")
     return data.get("count", 0)
 
 
@@ -607,12 +626,30 @@ async def export_pdf(session, path):
                       timeout=EXPORT_TIMEOUT)
 
 
+async def export_view(session, path, export_type="image"):
+    """Export the front view as image, PDF, or 2D DWG; raise on refusal."""
+    types = {"image": "Image", "pdf": "PDF", "dwg2d": "DWG 2D"}
+    if export_type not in types:
+        raise ValueError(f"unsupported export type: {export_type}")
+    target = str(Path(path).expanduser().resolve())
+    data = await call(session, "chief_export_data", exportType=types[export_type],
+                      exportPath=target, timeout=EXPORT_TIMEOUT)
+    if not isinstance(data, dict) or not data.get("success"):
+        reason = data.get("message") if isinstance(data, dict) else data
+        raise RuntimeError(reason or "view export failed")
+    return data
+
+
 # --------------------------------------------------------------------------
 # dialogs (the reliable edit channel)
 # --------------------------------------------------------------------------
 async def dialog_fields(session, panel=None):
-    return await call(session, "chief_discover_dialog_fields", panel=panel,
+    data = await call(session, "chief_discover_dialog_fields", panel=panel,
                       timeout=DIALOG_TIMEOUT)
+    if not isinstance(data, dict) or data.get("success") is False:
+        reason = data.get("message") if isinstance(data, dict) else data
+        raise RuntimeError(reason or "dialog field discovery failed")
+    return data
 
 
 def find_node(fields, node_id):
@@ -715,6 +752,7 @@ def free_point(bounds, objects, skip_ids=(), skip_names=("Room", "Exterior room"
     neighbours, and the exterior room spans the whole building, so treating them
     as obstacles would reject every candidate.
     """
+    steps = max(2, int(steps))
     skip = set(skip_ids)
     obstacles = []
     for obj in objects:
@@ -832,9 +870,9 @@ def title_matches(expect, title) -> bool:
 def title_tokens(name):
     """Distinctive lowercase words from an object name, for title matching.
 
-    Short words and object suffixes are dropped: "Hinged Door" becomes ``door``,
-    which is what a Door Specification title actually contains, and ``block_4``
-    becomes ``block``.
+    Short words and trailing digits are dropped: "Hinged Door" becomes
+    ``["hinged", "door"]`` -- either word satisfies ``title_matches`` against a
+    "Door Specification" title -- and ``block_4`` becomes ``["block"]``.
     """
     raw = "".join(ch if ch.isalnum() else " " for ch in (name or "")).split()
     words = []
@@ -865,7 +903,7 @@ async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts
             continue
         title = dialog.get("title") or ""
         if not title_matches(expect, title):
-            await press(session, "1", "Cancel", dialog.get("questionId"))
+            await _cancel(session, dialog.get("questionId"))
             wrong = title
             continue
         return dialog
@@ -880,6 +918,7 @@ def scan_points(bounds, steps: int = 7, inset: float = 1.0):
     is also where an overlapping marker or dimension line tends to sit, which is
     the whole reason the scan exists.
     """
+    steps = max(2, int(steps))
     minx, maxx = bounds["minX"] + inset, bounds["maxX"] - inset
     miny, maxy = bounds["minY"] + inset, bounds["maxY"] - inset
     if maxx <= minx or maxy <= miny:
@@ -1030,21 +1069,35 @@ async def move_object(session, bounds, objects, dx=0.0, dy=0.0, skip_ids=()):
     Works on objects whose Specification dialog exposes ``boxID_XPos`` /
     ``boxID_YPos`` on the General panel (CAD blocks, text, and similar).
     """
-    async with spec_dialog(session, bounds, objects, skip_ids=skip_ids) as dialog:
+    ids = set(skip_ids)
+    target = next((obj for obj in objects if obj.get("objectId") in ids), None) if len(ids) == 1 else None
+    async with spec_dialog(session, bounds, objects, skip_ids=skip_ids, target=target,
+                           expect=title_tokens(target.get("name")) if target else None) as dialog:
         question = dialog.get("questionId")
         fields = await dialog_fields(session, panel="General")
         x_node = find_node(fields, "boxID_XPos")
         y_node = find_node(fields, "boxID_YPos")
         if x_node is None or y_node is None:
             raise RuntimeError("that dialog has no X/Y position fields")
+        if any(delta and (node.get("value") is None or not str(node["value"]).strip())
+               for delta, node in ((dx, x_node), (dy, y_node))):
+            raise RuntimeError("the position fields have no value to adjust")
 
-        if dx:
-            await set_field(session, "boxID_XPos",
-                            value=f'{parse_inches(x_node["value"]) + dx}"', question=question)
-        if dy:
-            await set_field(session, "boxID_YPos",
-                            value=f'{parse_inches(y_node["value"]) + dy}"', question=question)
-        await press(session, "0", "OK", question)
+        for axis, delta, node in (("x", dx, x_node), ("y", dy, y_node)):
+            if delta:
+                # The dialog displays rounded fractions. The discovered position
+                # keeps the precision needed for an exact relative move.
+                base = target["location"][axis] if target else parse_inches(node["value"])
+                written = await set_field(
+                    session, node["id"],
+                    value=f'{base + delta}"', question=question)
+                if not isinstance(written, dict) or not written.get("written"):
+                    reason = written.get("refusal") if isinstance(written, dict) else written
+                    raise RuntimeError(reason or "position field was refused")
+        confirmed = await press(session, "0", "OK", question)
+        if not isinstance(confirmed, dict) or not confirmed.get("success"):
+            reason = confirmed.get("message") if isinstance(confirmed, dict) else confirmed
+            raise RuntimeError(reason or "position change was not confirmed")
 
 
 async def rename_room(session, bounds, objects, name, skip_ids=()):
@@ -1098,6 +1151,7 @@ async def room_metrics(session, rooms_list=None, limit=None):
     room is cancelled, never confirmed.
     """
     objs = await objects(session)
+    by_id = {o["objectId"]: o for o in objs}
     targets = rooms_list if rooms_list is not None else await rooms(session)
     if limit:
         targets = targets[:limit]
@@ -1108,18 +1162,26 @@ async def room_metrics(session, rooms_list=None, limit=None):
         if not bounds:
             continue
         try:
-            dialog = await open_spec(session, bounds, objs,
-                                     skip_ids=[room.get("objectId")], expect="Room")
+            target = by_id.get(room.get("objectId"))
+            if target is not None:
+                dialog = await open_spec_anywhere(session, target, objs, expect="Room")
+            else:
+                dialog = await open_spec(session, bounds, objs,
+                                         skip_ids=[room.get("objectId")], expect="Room")
         except RuntimeError as exc:
             rows.append({"name": room.get("roomName"), "error": str(exc)})
             continue
 
         question = dialog.get("questionId")
-        fields = await dialog_fields(session, panel="General")
+        try:
+            fields = await dialog_fields(session, panel="General")
+        finally:
+            # cancel unconditionally, not just on success: a dialog left open
+            # strands every later room and every gesture after that
+            await _cancel(session, question)
         row = {"name": room.get("roomName"), "type": room.get("roomType")}
         for node_id, key in ROOM_FIELDS.items():
             row[key] = node_value(fields, node_id)
-        await press(session, "1", "Cancel", question)
         rows.append(row)
     return rows
 
@@ -1217,17 +1279,51 @@ def match_objects(objects_list, name=None, layer=None, floor=None, exact=False):
     ]
 
 
-async def describe_fields(session, object_id, objects_list=None, panel=None, expect=None):
+async def select_matching(session, name=None, layer=None, floor=None, exact=False):
+    """Select matching front-view objects and verify the complete selection.
+
+    At least one filter is required. No matches leaves the selection unchanged.
+    """
+    if not (name or layer or floor is not None):
+        raise ValueError("select requires a name, layer, or floor filter")
+    hits = match_objects(await objects(session), name=name, layer=layer, floor=floor, exact=exact)
+    if not hits:
+        return {"matched": 0, "selected": [], "unchanged": True}
+    wanted = {obj["objectId"] for obj in hits}
+    await select(session, [obj["objectId"] for obj in hits])
+    selected = await selection(session)
+    actual = {obj["objectId"] for obj in selected}
+    if actual != wanted:
+        raise RuntimeError(
+            f"selection verification failed: {len(wanted - actual)} missing, "
+            f"{len(actual - wanted)} unexpected object(s)"
+        )
+    return {"matched": len(hits), "selected": selected, "unchanged": False}
+
+
+async def describe_fields(session, object_id=None, objects_list=None, panel=None, expect=None,
+                          all_panels=False, include_options=False, contains=None):
     """Open one object's dialog and list its fields, without changing anything.
 
     Returns the panel names too: the dialog payload carries them, and guessing a
     panel name is what makes looking for a field tedious.
+
+    Omit object_id to inspect exactly one selected object. all_panels reads each
+    panel during the same opening; contains filters field ids and labels.
+    include_options retains inline and report-file options with their labels.
 
     The dialog is checked against the object's own name unless ``expect`` says
     otherwise. Without that check a room that cannot be reached reports whatever
     was under the click instead -- a dimension line, say -- which reads exactly
     like a successful answer.
     """
+    if panel and all_panels:
+        raise ValueError("choose a panel or all_panels, not both")
+    if object_id is None:
+        chosen = await selection(session)
+        if len(chosen) != 1:
+            raise RuntimeError(f"fields requires exactly one selected object; found {len(chosen)}")
+        object_id = chosen[0]["objectId"]
     objs = objects_list if objects_list is not None else await objects(session)
     target = next((o for o in objs if o["objectId"] == object_id), None)
     if target is None:
@@ -1238,22 +1334,40 @@ async def describe_fields(session, object_id, objects_list=None, panel=None, exp
     question = dialog.get("questionId")
     try:
         found = await dialog_fields(session, panel=panel)
-        panel_data = found.get("panel") or {}
-        # the gesture payload carries the panel names, and so does the field
-        # listing; take whichever answers
-        names = (dialog.get("panels") or found.get("panels") or [])
+        names = (found.get("panels") or dialog.get("panels") or [])
         panels = [p.get("name") for p in names if p.get("name")] or None
-        fields = [
-            {
-                "id": node.get("id"),
-                "label": node.get("label"),
-                "value": node.get("value"),
-                "support": node.get("support"),
-            }
-            for node in (panel_data.get("nodes") or [])
-            if node.get("kind") == "field"
-        ]
-        return {"title": dialog.get("title"), "panel": panel_data.get("title"),
+        current = ((found.get("panel") or {}).get("title") or panel
+                   or next((p["name"] for p in names if p.get("active")), None))
+        pending = [current]
+        if all_panels:
+            pending += [name for name in dict.fromkeys(panels or []) if name != current]
+        fields = []
+        for index, panel_name in enumerate(pending):
+            if index:
+                found = await dialog_fields(session, panel=panel_name)
+            for node in ((found.get("panel") or {}).get("nodes") or []):
+                if node.get("kind") != "field":
+                    continue
+                if contains and not any(contains.lower() in str(node.get(key) or "").lower()
+                                        for key in ("id", "label")):
+                    continue
+                field = {key: node.get(key) for key in ("id", "label", "value", "support")}
+                if all_panels:
+                    field["panel"] = panel_name
+                if include_options:
+                    constraints = node.get("constraints") or {}
+                    overflow = (found.get("overflow") or {}).get(node.get("id")) or {}
+                    options = next((source["options"] for source in (node, constraints, overflow)
+                                    if "options" in source), None)
+                    for key in ("currentSelectionLabel", "enabled"):
+                        if key in node:
+                            field[key] = node[key]
+                    if options is not None:
+                        field["options"] = options
+                    if "optionCount" in constraints:
+                        field["optionCount"] = constraints["optionCount"]
+                fields.append(field)
+        return {"title": dialog.get("title"), "panel": None if all_panels else current,
                 "panels": panels, "fields": fields}
     finally:
         await _cancel(session, question)
@@ -1335,6 +1449,11 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
             retried = await attempt(obj)
             if not retried.get("error"):
                 entry = {**retried, "retried": True}
+            else:
+                # keep both: the first error is what the run saw, the retry's is
+                # the state after settling
+                entry = {**entry, "retried": True,
+                         "retry_error": retried.get("error")}
 
         results.append(entry)
         if entry.get("error") and on_error == "stop":
@@ -1499,31 +1618,58 @@ PARK_MANIFEST = Path(os.environ.get(
 
 
 def _read_manifest() -> dict:
-    if not PARK_MANIFEST.is_file():
-        return {}
     try:
-        return json.loads(PARK_MANIFEST.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        data = json.loads(PARK_MANIFEST.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(f"cannot read parking manifest {PARK_MANIFEST}: {exc}") from exc
+    if not isinstance(data, dict) or any(
+        not isinstance(home, dict) or any(
+            type(home.get(axis)) not in (int, float) or not math.isfinite(home[axis])
+            for axis in ("x", "y")
+        ) for home in data.values()
+    ):
+        raise RuntimeError(f"invalid parking manifest {PARK_MANIFEST}")
+    return data
 
 
 def _write_manifest(data: dict) -> None:
-    PARK_MANIFEST.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    # Replace only a complete file: interruption must not truncate the sole
+    # record of the objects' original positions.
+    PARK_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=PARK_MANIFEST.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(json.dumps(data, indent=1, allow_nan=False))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, PARK_MANIFEST)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 async def park_objects(session, object_ids, apply=False, offset=PARK_OFFSET):
     """Move objects out of the way, since delete is refused over MCP.
 
     Returns the plan and moves nothing unless ``apply`` is true. Each parked id
-    is written to a manifest with its original position, so ``unpark_objects``
-    can put it back.
+    is written to a manifest before moving, so ``unpark_objects`` can put it
+    back even after an interrupted call. Failed attempts retain their home;
+    unpark clears them if the object never moved. Recorded ids are not reparked.
     """
     objs = await objects(session)
     index = {o["objectId"]: o for o in objs}
     dx, dy = offset
+    manifest = _read_manifest()
 
     plan = []
-    for oid in object_ids:
+    for oid in dict.fromkeys(object_ids):
+        if oid in manifest:
+            plan.append({"objectId": oid, "error": "already in the parking manifest"})
+            continue
         obj = index.get(oid)
         if obj is None:
             plan.append({"objectId": oid, "error": "not in the front view"})
@@ -1538,41 +1684,61 @@ async def park_objects(session, object_ids, apply=False, offset=PARK_OFFSET):
     if not apply:
         return {"applied": False, "plan": plan}
 
-    manifest = _read_manifest()
-    done = []
+    done, failed = [], [e for e in plan if "error" in e]
     for entry in plan:
         if "error" in entry:
             continue
         obj = index[entry["objectId"]]
-        await move_object(session, bbox(obj), objs, dx=dx, dy=dy,
-                          skip_ids=[entry["objectId"]])
+        # Save before moving: a timeout may occur after Chief committed the
+        # change. Keep the home even on failure; unpark also handles unmoved ids.
         manifest[entry["objectId"]] = entry["from"]
+        _write_manifest(manifest)
+        try:
+            await move_object(session, bbox(obj), objs, dx=dx, dy=dy,
+                              skip_ids=[entry["objectId"]])
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"objectId": entry["objectId"], "error": str(exc)})
+            continue
         done.append(entry["objectId"])
-    _write_manifest(manifest)
-    return {"applied": True, "moved": done, "manifest": str(PARK_MANIFEST)}
+    return {"applied": True, "moved": done, "failed": failed,
+            "manifest": str(PARK_MANIFEST)}
 
 
 async def unpark_objects(session, object_ids=None):
-    """Move parked objects back to where the manifest says they came from."""
+    """Move parked objects back to where the manifest says they came from.
+
+    Ids that were never parked are left alone, and one already home is cleared
+    from the manifest without opening a dialog for nothing. The manifest is
+    written after each restore, so a run interrupted mid-batch can be finished
+    by calling this again. Returns ``{"restored": [...], "failed": [...]}``.
+    """
     manifest = _read_manifest()
     targets = list(manifest) if object_ids is None else list(object_ids)
     objs = await objects(session)
     index = {o["objectId"]: o for o in objs}
 
-    restored = []
+    restored, failed = [], []
     for oid in targets:
         home = manifest.get(oid)
-        obj = index.get(oid)
-        if not home or obj is None:
+        if home is None:
             continue
-        await move_object(session, bbox(obj), objs,
-                          dx=home["x"] - obj["location"]["x"],
-                          dy=home["y"] - obj["location"]["y"],
-                          skip_ids=[oid])
+        obj = index.get(oid)
+        if obj is None:
+            failed.append({"objectId": oid, "error": "not in the front view"})
+            continue
+        dx = home["x"] - obj["location"]["x"]
+        dy = home["y"] - obj["location"]["y"]
+        if dx or dy:
+            try:
+                await move_object(session, bbox(obj), objs, dx=dx, dy=dy,
+                                  skip_ids=[oid])
+            except Exception as exc:  # noqa: BLE001
+                failed.append({"objectId": oid, "error": str(exc)})
+                continue
         manifest.pop(oid, None)
+        _write_manifest(manifest)
         restored.append(oid)
-    _write_manifest(manifest)
-    return restored
+    return {"restored": restored, "failed": failed}
 
 
 # --------------------------------------------------------------------------
@@ -1605,6 +1771,21 @@ async def _main(args):
             _print_objects(await objects(s, entire=args.entire), args.name)
         elif args.cmd == "selection":
             _print_objects(await selection(s))
+        elif args.cmd == "select":
+            if args.clear:
+                await select(s, [])
+                if await selection(s):
+                    raise RuntimeError("selection was not cleared")
+                print("selection cleared")
+            else:
+                report = await select_matching(s, name=args.name, layer=args.layer,
+                                               floor=args.floor, exact=args.exact)
+                if not report["matched"]:
+                    print("nothing matched; selection unchanged")
+                else:
+                    for obj in report["selected"]:
+                        print(f"{obj['objectId']}  {obj.get('name') or '(unnamed)'}")
+                    print(f"-- {len(report['selected'])} selected (verified)")
         elif args.cmd == "audit":
             findings = await audit(s)
             if not findings:
@@ -1628,12 +1809,24 @@ async def _main(args):
                 print(f"{obj['objectId']}  {obj['name']:<20} layer={obj['layer']}")
             print(f"-- {len(hits)} match(es)")
         elif args.cmd == "fields":
-            info = await describe_fields(s, args.object_id, panel=args.panel, expect=args.expect)
-            print(f"{info['title']} / {info['panel']}")
+            info = await describe_fields(s, args.object_id, panel=args.panel, expect=args.expect,
+                                         all_panels=args.all_panels, include_options=args.options,
+                                         contains=args.contains)
+            print(f"{info['title']} / {info['panel'] or 'all panels'}")
             if info.get("panels"):
                 print("  panels: " + ", ".join(info["panels"]))
             for field in info["fields"]:
-                print(f"  {str(field['id']):<34} {str(field['value'])[:38]:<40} {field['support']}")
+                prefix = f"[{field['panel']}] " if args.all_panels else ""
+                label = f" ({field['label']})" if field.get("label") else ""
+                print(f"  {prefix}{field['id']}{label}: {str(field['value'])[:80]}  {field['support']}")
+                if args.options:
+                    if "currentSelectionLabel" in field:
+                        print(f"    selected: {field['currentSelectionLabel']}")
+                    for option in field.get("options") or []:
+                        disabled = " (disabled)" if option.get("enabled") is False else ""
+                        print(f"    {option['optionId']}: {option['label']}{disabled}")
+                    if "optionCount" in field and "options" not in field:
+                        print(f"    {field['optionCount']} option(s); option list unavailable")
         elif args.cmd == "apply":
             if args.selected:
                 targets = await selection(s)
@@ -1726,7 +1919,11 @@ async def _main(args):
             names = [t["name"] for t in (data.get("tools") or [])] if isinstance(data, dict) else []
             print("\n".join(names) or data)
         elif args.cmd == "image":
-            print((await export_image(s, args.path)).get("message"))
+            result = await export_image(s, args.path)
+            print(result.get("message") if isinstance(result, dict) else result)
+        elif args.cmd == "export":
+            result = await export_view(s, args.path, export_type=args.type)
+            print(f"{result.get('message') or 'Exported view.'} {result.get('exportPath') or args.path}")
 
 
 def find_exception(exc, kind):
@@ -1760,6 +1957,12 @@ def main(argv=None):
     objs.add_argument("--entire", action="store_true", help="whole document")
     objs.add_argument("--name", help="filter by object name or layer substring")
     sub.add_parser("selection", help="current selection")
+    choose = sub.add_parser("select", help="select matching objects and verify the selection")
+    choose.add_argument("--name")
+    choose.add_argument("--layer")
+    choose.add_argument("--floor", type=int)
+    choose.add_argument("--exact", action="store_true", help="whole-string match")
+    choose.add_argument("--clear", action="store_true", help="clear the selection")
     sub.add_parser("audit", help="read-only checks on the front view")
     sub.add_parser("metrics", help="room areas and perimeters, read from each dialog")
     find = sub.add_parser("find", help="list objects matching name, layer, or floor")
@@ -1768,8 +1971,13 @@ def main(argv=None):
     find.add_argument("--floor", type=int)
     find.add_argument("--exact", action="store_true", help="whole-string match")
     inspect = sub.add_parser("fields", help="list an object's dialog fields, read-only")
-    inspect.add_argument("object_id")
-    inspect.add_argument("--panel")
+    inspect.add_argument("object_id", nargs="?")
+    inspect.add_argument("--selected", action="store_true", help="inspect exactly one selected object")
+    field_panels = inspect.add_mutually_exclusive_group()
+    field_panels.add_argument("--panel")
+    field_panels.add_argument("--all-panels", action="store_true", help="inspect every listed panel")
+    inspect.add_argument("--contains", help="filter field ids or labels by substring, ignoring case")
+    inspect.add_argument("--options", action="store_true", help="show option ids, labels, and disabled choices")
     inspect.add_argument("--expect", help="require this word in the dialog title (default: from the object name)")
     bulk = sub.add_parser("apply", help="write one dialog field on many matching objects")
     bulk.add_argument("--selected", action="store_true",
@@ -1815,7 +2023,16 @@ def main(argv=None):
     sub.add_parser("tools", help="list MCP tools")
     img = sub.add_parser("image", help="export front view to PNG")
     img.add_argument("path")
+    export = sub.add_parser("export", help="export the front view to image, PDF, or 2D DWG")
+    export.add_argument("--type", choices=["image", "pdf", "dwg2d"], required=True)
+    export.add_argument("path")
     args = parser.parse_args(argv)
+    if args.cmd == "fields" and bool(args.object_id) == args.selected:
+        parser.error("fields requires an object id or --selected, but not both")
+    if args.cmd == "select":
+        filtered = bool(args.name or args.layer or args.floor is not None)
+        if args.clear == filtered:
+            parser.error("select requires a name/layer/floor filter or --clear, but not both")
     if args.timeout is not None:
         os.environ["CAMCP_CALL_TIMEOUT"] = str(args.timeout)
     snapshot_file = getattr(args, "snapshot", None)
