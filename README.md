@@ -19,7 +19,6 @@ This toolkit papers over that, and records what actually works.
 | `instruction-set.md` | Guardrails to paste into an agent's rules file |
 | `selftest.py` | Read-only smoke test: connect, list views/rooms, pick a hit point |
 | `NOTES.md` | Field notes: capability matrix, working recipes, pitfalls |
-| `privacy_check.py` | Fails if personal or secret-looking data reaches tracked files |
 
 ## Helpers
 
