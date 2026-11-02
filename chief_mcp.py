@@ -38,6 +38,26 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 REPO_ROOT = Path(__file__).resolve().parent
+TRACE_ON = bool(os.environ.get("CAMCP_TRACE"))
+TRACE_FILE = Path(os.environ.get(
+    "CAMCP_TRACE_FILE", Path.home() / ".chief_mcp" / "trace.jsonl"
+))
+
+
+def _trace(record: dict) -> None:
+    """Append one line per MCP call when CAMCP_TRACE is set.
+
+    A call that hangs shows up as a start with no end, which is the only way to
+    tell "Chief is busy" from "the agent gave up" after the fact.
+    """
+    if not TRACE_ON:
+        return
+    try:
+        TRACE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with TRACE_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        pass
 
 
 def load_env(path: Path | None = None) -> None:
@@ -134,7 +154,18 @@ def _payload(result):
 async def call(session: ClientSession, tool: str, **arguments):
     """Call a tool; report files are loaded for you."""
     args = {k: v for k, v in arguments.items() if v is not None}
-    return _payload(await session.call_tool(tool, args))
+    started = time.monotonic()
+    _trace({"event": "call", "tool": tool, "args": args})
+    try:
+        payload = _payload(await session.call_tool(tool, args))
+    except BaseException as exc:
+        _trace({"event": "raise", "tool": tool, "error": repr(exc),
+                "seconds": round(time.monotonic() - started, 3)})
+        raise
+    _trace({"event": "done", "tool": tool,
+            "success": payload.get("success") if isinstance(payload, dict) else None,
+            "seconds": round(time.monotonic() - started, 3)})
+    return payload
 
 
 async def raw(session: ClientSession, tool: str, **arguments):
@@ -191,8 +222,14 @@ async def status(session):
 # --------------------------------------------------------------------------
 # window activation -- the manual "click into Chief" step, done for you
 # --------------------------------------------------------------------------
-VK_MENU, VK_ESCAPE, KEYEVENTF_KEYUP, SW_RESTORE = 0x12, 0x1B, 0x0002, 9
+VK_MENU, VK_ESCAPE, VK_TAB, KEYEVENTF_KEYUP, SW_RESTORE = 0x12, 0x1B, 0x09, 0x0002, 9
 CHIEF_TITLE = "Chief Architect Premier"
+
+# Escape dismisses a text edit; Tab cycles the selection through objects stacked
+# under the cursor, which is how a covered object gets picked. Both are additive
+# to the selection, not to the drawing. Everything else -- Delete above all -- is
+# refused by the server on purpose and stays refused here.
+SAFE_KEYS = {"Escape": VK_ESCAPE, "Tab": VK_TAB}
 
 
 def _user32():
@@ -274,33 +311,79 @@ def ensure_active(title_part: str = CHIEF_TITLE, lib=None, attempts: int = 12,
             "changed": True, "foreground": after}
 
 
-def send_escape(lib=None, presses: int = 1, delay: float = 0.08) -> bool:
-    """Press Escape in whatever window has the foreground.
+def send_key(name: str, lib=None, presses: int = 1, delay: float = 0.08) -> bool:
+    """Tap a whitelisted key in whatever window has the foreground.
 
-    Only Escape is exposed. Chief refuses Delete and other hotkeys over MCP on
-    purpose, and driving those through the keyboard would be a way around that
-    guardrail rather than a feature.
+    Chief refuses hotkeys over MCP without Project Management, and Delete and the
+    edit commands stay refused on purpose -- driving those through the keyboard
+    would be a way around the guardrail. What is here is limited to Escape
+    (dismiss an in-place text edit) and Tab (cycle the selection through stacked
+    objects), neither of which changes the drawing.
     """
+    if name not in SAFE_KEYS:
+        raise ValueError(f"{name!r} is not on the allowed list: {sorted(SAFE_KEYS)}")
     lib = lib or _user32()
     if lib is None:
         return False
+    if CHIEF_TITLE.lower() not in (foreground_title(lib) or "").lower():
+        # keybd_event lands in whatever owns the foreground. Refuse rather than
+        # type into another window, and do not steal the foreground to get here:
+        # call ensure_active() first when fronting Chief is what you want.
+        return False
+    vk = SAFE_KEYS[name]
     for _ in range(max(presses, 1)):
-        lib.keybd_event(VK_ESCAPE, 0, 0, 0)
-        lib.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
+        lib.keybd_event(vk, 0, 0, 0)
+        lib.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
         time.sleep(delay)
     return True
 
 
-async def recover(session, keyboard: bool = False) -> dict:
-    """Get Chief back to a state that accepts gestures.
+def send_escape(lib=None, presses: int = 1, delay: float = 0.08) -> bool:
+    """Press Escape. Kept as a name because it reads better at call sites."""
+    return send_key("Escape", lib=lib, presses=presses, delay=delay)
+
+
+async def cycle_selection(session, point, target_id, presses: int = 12):
+    """Click a point, then Tab through the objects stacked there until one matches.
+
+    Clicking selects whichever object is topmost, so a door with a marker on top
+    cannot be picked by position alone. Tab walks the stack under the cursor.
+    Returns the objectIds passed through, as evidence of what was actually there.
+    """
+    await select(session, [])
+    reply = await click(session, point[0], point[1])
+    if not isinstance(reply, dict) or not reply.get("success"):
+        return None, []
+    seen: list = []
+    for _ in range(presses):
+        selected = [s.get("objectId") for s in await selection(session)]
+        for object_id in selected:
+            if object_id not in seen:
+                seen.append(object_id)
+        if target_id in selected:
+            return point, seen
+        if not send_key("Tab"):
+            break
+        time.sleep(0.25)
+    return None, seen
+
+
+async def recover(session, keyboard: bool = False, focus: bool = False) -> dict:
+    """Get Chief back to a state that accepts gestures, without touching focus.
 
     A dialog with a focused edit box holds the keyboard, and every gesture is
     then refused until someone dismisses it -- nothing times out, so it waits
-    indefinitely. This fronts the window, cancels the agent-tracked dialog and
-    closes any untracked one left on top. ``keyboard`` also taps Escape, which
-    clears an in-place text edit, the state that has no dialog to inspect.
+    indefinitely. This cancels the agent-tracked dialog and closes any untracked
+    one left on top.
+
+    ``keyboard`` taps Escape, for an in-place text edit that has no dialog to
+    inspect, and ``focus`` fronts the window first. Both are off by default: an
+    ALT tap can leave a menu grabbed in whatever window had the foreground, and
+    taking the foreground is disruptive enough that it should be asked for.
     """
-    steps: dict = {"activation": ensure_active()}
+    steps: dict = {}
+    if focus:
+        steps["activation"] = ensure_active()
     steps["cancelled"] = await clear_dialogs(session)
 
     dialogs = await call(session, "chief_discover_open_dialogs")
@@ -330,13 +413,14 @@ async def select(session, object_ids):
     return data.get("count", 0)
 
 
-async def gesture(session, gestures, activate=True):
-    """Send canvas gestures, giving Chief the foreground first.
+async def gesture(session, gestures, activate=False):
+    """Send canvas gestures.
 
-    Clicks do land while Chief is covered or minimized, so this is not strictly
-    required -- but Windows only hands over the foreground after an ALT tap, and
-    an inactive window is where runs looked like they had stalled. ``activation``
-    in the reply records what happened, so a run can be explained afterwards.
+    ``activate`` is off by default on purpose. A click already brings Chief
+    forward by itself, so forcing activation first buys nothing and takes the
+    keyboard away from whatever the user is typing into -- it reads as the app
+    hanging on input until they click back. Call ``recover()`` when the window
+    really does need fronting.
     """
     state = ensure_active() if activate else None
     data = await call(session, "chief_input_canvas_gesture", gestures=gestures)
@@ -345,11 +429,11 @@ async def gesture(session, gestures, activate=True):
     return data
 
 
-async def click(session, x, y, activate=True):
+async def click(session, x, y, activate=False):
     return await gesture(session, [{"type": "click", "button": "left", "x": x, "y": y}], activate)
 
 
-async def dblclick(session, x, y, activate=True):
+async def dblclick(session, x, y, activate=False):
     """Open a Specification dialog. Returns the dialog descriptor."""
     return await gesture(session, [{"type": "doubleClick", "button": "left", "x": x, "y": y}], activate)
 
@@ -567,17 +651,119 @@ async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts
     raise RuntimeError(f"no matching dialog opened inside those bounds{suffix}")
 
 
+def scan_points(bounds, steps: int = 7, inset: float = 1.0):
+    """Centre-out grid of points inside ``bounds``, for hit testing.
+
+    Centre first because that is where a person clicks; the object's own centre
+    is also where an overlapping marker or dimension line tends to sit, which is
+    the whole reason the scan exists.
+    """
+    minx, maxx = bounds["minX"] + inset, bounds["maxX"] - inset
+    miny, maxy = bounds["minY"] + inset, bounds["maxY"] - inset
+    if maxx <= minx or maxy <= miny:
+        minx, maxx = bounds["minX"], bounds["maxX"]
+        miny, maxy = bounds["minY"], bounds["maxY"]
+    cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+    points = []
+    for i in range(steps):
+        for j in range(steps):
+            x = minx + (maxx - minx) * i / (steps - 1)
+            y = miny + (maxy - miny) * j / (steps - 1)
+            points.append(((x - cx) ** 2 + (y - cy) ** 2, x, y))
+    points.sort()
+    return [(x, y) for _, x, y in points]
+
+
+async def hit_point(session, obj, steps: int = 7, inset: float = 1.0):
+    """A point inside the object's bounds where a click actually selects it.
+
+    Whatever is topmost takes the click, so a covered object cannot be reached by
+    clicking its centre, and modifiers do not cycle here. Scanning the bounds and
+    reading back the selection sidesteps that: usually one or two clicks away.
+    Returns ``None`` when no point in the box selects it. Costs one click per
+    point tried, so shortcut by trying a geometric point first.
+    """
+    for x, y in scan_points(bbox(obj), steps=steps, inset=inset):
+        await select(session, [])
+        reply = await click(session, x, y)
+        if not isinstance(reply, dict) or not reply.get("success"):
+            return None
+        if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
+            return x, y
+    return None
+
+
+async def reachable_point(session, obj, steps: int = 7, presses: int = 8):
+    """A point where ``obj`` is the selected object, by the cheapest route.
+
+    Clicking picks whatever is topmost, so try the centre first; if something
+    else takes it, Tab through the stack under the cursor, which is the same
+    gesture a person uses for covered objects. Scanning the bounds is the last
+    resort, since it costs a click per point.
+    """
+    bounds = bbox(obj)
+    x = (bounds["minX"] + bounds["maxX"]) / 2
+    y = (bounds["minY"] + bounds["maxY"]) / 2
+
+    await select(session, [])
+    reply = await click(session, x, y)
+    if not isinstance(reply, dict) or not reply.get("success"):
+        return None
+    if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
+        return x, y
+
+    for _ in range(presses):
+        if not send_key("Tab"):
+            break
+        time.sleep(0.15)
+        if obj["objectId"] in [s.get("objectId") for s in await selection(session)]:
+            return x, y
+
+    return await hit_point(session, obj, steps=steps)
+
+
+async def open_spec_anywhere(session, obj, objects, expect=None, attempts=4, steps=7):
+    """Open an object's Specification dialog, reaching it by any means.
+
+    The geometric point can land on a marker, a dimension line, or a room face
+    instead of the object. When it does, the click that would select the object
+    is spent finding a real point rather than reporting the object unreachable.
+    """
+    try:
+        return await open_spec(session, bbox(obj), objects, skip_ids=[obj["objectId"]],
+                               expect=expect, attempts=attempts)
+    except RuntimeError:
+        point = await reachable_point(session, obj, steps=steps)
+        if point is None:
+            raise
+        dialog = await dblclick(session, *point)
+        if not (isinstance(dialog, dict) and dialog.get("kind") == "dialog"):
+            raise
+        title = dialog.get("title") or ""
+        if expect and expect.lower() not in title.lower():
+            await press(session, "1", "Cancel", dialog.get("questionId"))
+            raise RuntimeError(f"selected the object but the dialog opened was {title!r}")
+        return dialog
+
+
 @asynccontextmanager
-async def spec_dialog(session, bounds, objects, skip_ids=(), expect=None, attempts=4):
+async def spec_dialog(session, bounds, objects, skip_ids=(), expect=None, attempts=4, target=None):
     """Open a Specification dialog and cancel it if the body raises.
 
     A dialog with a focused edit box holds the keyboard: every gesture is then
     refused, and nothing times out, so one abandoned dialog waits indefinitely
     and costs the rest of the session. Using this instead of calling open_spec
     directly means a crash mid-edit cleans up after itself.
+
+    Pass ``target`` (the object dict) to fall back to scanning its bounds when the
+    geometric hit point lands on something else.
     """
-    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids,
-                             expect=expect, attempts=attempts)
+    if target is not None:
+        dialog = await open_spec_anywhere(session, target, objects, expect=expect,
+                                          attempts=attempts)
+    else:
+        dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids,
+                                 expect=expect, attempts=attempts)
     try:
         yield dialog
     except BaseException:
@@ -837,8 +1023,7 @@ async def apply_property(session, targets, field_id, value=None, option=None, pa
             continue
 
         try:
-            dialog = await open_spec(session, bbox(obj), objects_list,
-                                     skip_ids=[obj["objectId"]], expect=expect)
+            dialog = await open_spec_anywhere(session, obj, objects_list, expect=expect)
         except RuntimeError as exc:
             results.append({**entry, "error": str(exc)})
             if on_error == "stop":
@@ -1181,8 +1366,9 @@ async def _main(args):
             print(f"foreground after  : {state.get('foreground')!r}")
             print(f"active={state.get('active')} changed={state.get('changed')}")
         elif args.cmd == "recover":
-            steps = await recover(s, keyboard=args.keyboard)
-            print(f"foreground  : {steps['activation'].get('foreground')!r}")
+            steps = await recover(s, keyboard=args.keyboard, focus=args.focus)
+            if args.focus:
+                print(f"foreground  : {steps['activation'].get('foreground')!r}")
             print(f"cancelled   : {steps['cancelled']!r}")
             print(f"force-closed: {steps['closed']}")
             if args.keyboard:
@@ -1246,6 +1432,8 @@ def main(argv=None):
     rec = sub.add_parser("recover", help="clear a dialog or text edit that is holding the keyboard")
     rec.add_argument("--keyboard", action="store_true",
                      help="also tap Escape, for an in-place text edit with no dialog")
+    rec.add_argument("--focus", action="store_true",
+                     help="front the Chief window first; off by default because it steals the keyboard")
     sub.add_parser("views", help="open views")
     doc = sub.add_parser("docs", help="search Chief's help")
     doc.add_argument("query")

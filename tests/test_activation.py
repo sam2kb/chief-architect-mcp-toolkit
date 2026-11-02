@@ -139,11 +139,30 @@ class EnsureActiveTests(unittest.TestCase):
 
 class SendEscapeTests(unittest.TestCase):
     def test_taps_escape_down_and_up(self):
-        lib = FakeUser32({})
+        lib = FakeUser32({2: "Chief Architect Premier X18"}, foreground=2)
         self.assertTrue(chief_mcp.send_escape(lib=lib, presses=2, delay=0))
         taps = [call for call in lib.calls if call[0] == "keybd_event"]
         self.assertEqual(taps, [("keybd_event", chief_mcp.VK_ESCAPE)] * 4,
                          "two presses, each a down and an up")
+
+    def test_tab_is_allowed(self):
+        lib = FakeUser32({2: "Chief Architect Premier X18"}, foreground=2)
+        self.assertTrue(chief_mcp.send_key("Tab", lib=lib, delay=0))
+        self.assertIn(("keybd_event", chief_mcp.VK_TAB), lib.calls)
+
+    def test_other_keys_are_refused(self):
+        lib = FakeUser32({2: "Chief Architect Premier X18"}, foreground=2)
+        for name in ("Delete", "Ctrl+Z", "Enter"):
+            with self.assertRaises(ValueError):
+                chief_mcp.send_key(name, lib=lib)
+        self.assertEqual(lib.calls, [])
+
+    def test_refuses_to_type_into_whichever_app_is_in_front(self):
+        lib = FakeUser32({1: "Visual Studio Code", 2: "Chief Architect Premier X18"},
+                         foreground=1, restore_moves_foreground=False)
+        self.assertFalse(chief_mcp.send_key("Tab", lib=lib, delay=0))
+        self.assertEqual(lib.calls, [],
+                         "no keys, and no stealing the foreground to deliver them")
 
     def test_without_a_windows_api_it_reports_failure(self):
         with mock.patch.object(chief_mcp, "_user32", return_value=None):

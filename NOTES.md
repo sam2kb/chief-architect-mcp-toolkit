@@ -73,6 +73,13 @@ server, which needs a Google API key and is not registered by default.
   Escape for an in-place text edit, the case with no dialog to inspect. Escape
   is the only key exposed: Delete and the other hotkeys are refused over MCP by
   design, and driving them through Win32 would be a way around that, not a fix.
+- **Do not front the window before every gesture.** A click already activates
+  Chief, so pre-activation adds nothing and steals the keyboard from whatever the
+  user is typing into; it reads as the app hanging on input until they click back
+  to their editor. Worse, the ALT tap Windows requires can leave a menu grabbed
+  in the window that had focus, and then clicking that window is not enough.
+  Nothing in the module touches the foreground unless asked: `recover(focus=True)`
+  or `python chief_mcp.py active`.
 - **Gestures are not blocked by a background window, but activation is blocked
   until ALT is tapped.** Measured here: the same double-click opened its dialog
   with Chief covered by another app, minimized, and in front; a 9-door

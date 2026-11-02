@@ -26,10 +26,11 @@ Reads: `objects`, `properties`, `rooms`, `selection`, `views`, `commands`,
 `docs`, `status`.
 
 Input: `select`, `click`, `dblclick`, `export_image`, `export_pdf`. Clicks go
-through `gesture`, which gives Chief the foreground first: Windows refuses
-`SetForegroundWindow` from a background process until an ALT tap unlocks it, so
-`ensure_active` does that tap, restores the window and waits for the switch to
-settle. `foreground_title` and `find_window` are the read-backs behind it, and
+through `gesture`, which does *not* front the window first: a click brings Chief
+forward on its own, and forcing activation takes the keyboard from whatever the
+user is typing into, which reads as the app hanging until they click back.
+`ensure_active` is there for the times it is genuinely wanted — it taps ALT,
+which is what Windows requires before it will grant the foreground — and
 `python chief_mcp.py active` runs the same thing from a shell.
 
 Dialogs (the reliable way to edit anything): `dialog_fields`, `find_node`,
@@ -45,11 +46,18 @@ They go through `spec_dialog`, a context manager that cancels the dialog if the
 body raises: a dialog left open holds the keyboard and refuses every later
 gesture, with no timeout.
 
-When one is already stuck, `recover()` fronts the window, cancels the tracked
-dialog, force-closes anything left on top, and reports whether a dialog is still
-open. `recover(keyboard=True)` also taps Escape, which clears an in-place text
-edit that has no dialog to inspect. `python chief_mcp.py recover --keyboard`
-does the same from a shell.
+When one is already stuck, `recover()` cancels the tracked dialog, force-closes
+anything left on top, and reports whether a dialog is still open. Nothing in this
+module takes the foreground on its own: doing so steals the keyboard from
+whatever you are typing into, and the ALT tap Windows requires can leave a menu
+grabbed in the window that had focus. `recover(focus=True)` and
+`python chief_mcp.py active` are the deliberate exceptions.
+`recover(keyboard=True)` taps Escape, which clears an in-place text edit that has
+no dialog to inspect.
+
+Set `CAMCP_TRACE=1` (and optionally `CAMCP_TRACE_FILE`) to append a line per MCP
+call to `~/.chief_mcp/trace.jsonl`. A hang shows up as a `call` with no matching
+`done`, which distinguishes "Chief is busy" from "the agent stopped talking".
 
 Reading the model: `audit` checks the front view for unnamed rooms, zero-size
 objects, text on the wrong layer, locked layers, and exact duplicates.
