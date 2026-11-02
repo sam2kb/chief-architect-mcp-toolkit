@@ -98,6 +98,14 @@ Three rules fell out of that:
 
 ## Pitfalls
 
+- **These tools do not fail fast, so every call runs under a watchdog.** A dialog
+  tool with no tracked dialog open waits forever instead of refusing, and an app
+  wedged on an in-place edit answers nothing at all. Calls now carry a deadline
+  (`CAMCP_CALL_TIMEOUT`, default 2s): overrunning it aborts the call, closes the
+  top-most modal, taps Escape, and raises `CallTimeout`. Measured calls all
+  finished inside 0.6s, which is where the default comes from. A tripped session
+  may be unusable afterwards, so settle or restart rather than retrying the same
+  call.
 - **A dialog opened by keyboard is not scriptable, and reading it hangs.** Ctrl+E
   does open the selected object's specification, which is why it looks like the
   way around double-clicking. But the dialog arrives with `agentTracked: false`:

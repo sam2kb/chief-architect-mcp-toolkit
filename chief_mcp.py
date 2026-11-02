@@ -126,6 +126,31 @@ SERVER_NAME = os.environ.get("CAMCP_SERVER", "ca-mcp-x18")
 # one is open blocks indefinitely -- it waits for a question that never arrives.
 DIALOG_TIMEOUT = 15.0
 
+# Watchdog for every other call. Measured calls all finished inside 0.6s, so a
+# couple of seconds without an answer means the app is not going to give one.
+CALL_TIMEOUT = 2.0
+EXPORT_TIMEOUT = 60.0
+
+
+def call_timeout() -> float:
+    """Per-call watchdog in seconds, overridable with CAMCP_CALL_TIMEOUT."""
+    try:
+        return float(os.environ.get("CAMCP_CALL_TIMEOUT", CALL_TIMEOUT))
+    except ValueError:
+        return CALL_TIMEOUT
+
+
+class CallTimeout(RuntimeError):
+    """An MCP call overran the watchdog. Recovery has already been attempted."""
+
+    def __init__(self, tool: str, seconds: float):
+        super().__init__(
+            f"{tool} did not answer within {seconds:g}s, so it was aborted and the app "
+            "was nudged back to a usable state"
+        )
+        self.tool = tool
+        self.seconds = seconds
+
 
 # --------------------------------------------------------------------------
 # transport
@@ -184,21 +209,30 @@ def _payload(result):
     return merged
 
 
-async def call(session: ClientSession, tool: str, timeout=None, **arguments):
+async def call(session: ClientSession, tool: str, timeout=None, recover=True, **arguments):
     """Call a tool; report files are loaded for you.
 
-    ``timeout`` exists because some tools block instead of refusing: a dialog tool
-    called when no agent-tracked dialog is open waits for one that is never
-    coming. A deadline turns that into an error, which is recoverable.
+    Every call runs under a watchdog, because these tools do not fail fast: a
+    dialog tool with no tracked dialog, or the app wedged on an in-place edit,
+    waits for something that never arrives. Overrunning it aborts the call, runs
+    ``recover_after_timeout`` once, and raises ``CallTimeout`` -- an error that
+    can be handled, instead of a terminal that sits there.
+
+    ``timeout=0`` disables the watchdog for calls known to be slow, and
+    ``recover=False`` is for the recovery calls themselves.
     """
     args = {k: v for k, v in arguments.items() if v is not None}
+    seconds = call_timeout() if timeout is None else timeout
     started = time.monotonic()
     _trace({"event": "call", "tool": tool, "args": args})
     try:
-        if timeout:
-            payload = _payload(await asyncio.wait_for(session.call_tool(tool, args), timeout))
-        else:
-            payload = _payload(await session.call_tool(tool, args))
+        result = await asyncio.wait_for(session.call_tool(tool, args), seconds or None)
+        payload = _payload(result)
+    except (asyncio.TimeoutError, TimeoutError):
+        _trace({"event": "timeout", "tool": tool, "seconds": seconds})
+        if recover:
+            await recover_after_timeout(session)
+        raise CallTimeout(tool, seconds) from None
     except BaseException as exc:
         _trace({"event": "raise", "tool": tool, "error": repr(exc),
                 "seconds": round(time.monotonic() - started, 3)})
@@ -207,6 +241,31 @@ async def call(session: ClientSession, tool: str, timeout=None, **arguments):
             "success": payload.get("success") if isinstance(payload, dict) else None,
             "seconds": round(time.monotonic() - started, 3)})
     return payload
+
+
+async def recover_after_timeout(session, budget: float = 1.5) -> list:
+    """Best-effort unstick after a call overran. Never raises.
+
+    Closes whatever untracked modal is on top and taps Escape, which is what a
+    person does when the app stops answering. The recovery calls carry their own
+    short deadlines and cannot trigger another recovery, so a wedged app ends in a
+    clear error rather than a loop.
+    """
+    steps: list = []
+    try:
+        await asyncio.wait_for(
+            call(session, "chief_force_close_dialog", timeout=budget, recover=False), budget
+        )
+        steps.append("force_close")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if send_escape(steal=True):
+            steps.append("escape")
+    except Exception:  # noqa: BLE001
+        pass
+    _trace({"event": "recovered", "steps": steps})
+    return steps
 
 
 # --------------------------------------------------------------------------
@@ -517,11 +576,13 @@ async def dblclick(session, x, y, activate=False):
 
 
 async def export_image(session, path):
-    return await call(session, "chief_export_data", exportType="Image", exportPath=path)
+    return await call(session, "chief_export_data", exportType="Image", exportPath=path,
+                      timeout=EXPORT_TIMEOUT)
 
 
 async def export_pdf(session, path):
-    return await call(session, "chief_export_data", exportType="PDF", exportPath=path)
+    return await call(session, "chief_export_data", exportType="PDF", exportPath=path,
+                      timeout=EXPORT_TIMEOUT)
 
 
 # --------------------------------------------------------------------------
@@ -1617,8 +1678,26 @@ async def _main(args):
             print((await export_image(s, args.path)).get("message"))
 
 
+def find_timeout(exc):
+    """The CallTimeout inside an exception, including one wrapped by anyio.
+
+    The stdio client runs in a task group, so anything raised inside the session
+    arrives wrapped in an ExceptionGroup. The cause is still worth reporting
+    plainly instead of as a traceback.
+    """
+    if isinstance(exc, CallTimeout):
+        return exc
+    for nested in getattr(exc, "exceptions", ()) or ():
+        found = find_timeout(nested)
+        if found is not None:
+            return found
+    return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Chief Architect MCP helpers")
+    parser.add_argument("--timeout", type=float, metavar="SECONDS",
+                        help="abort a call that takes longer than this (default 2.0; 0 disables)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("rooms", help="room list with clear dimensions")
     objs = sub.add_parser("objects", help="objects in the front view")
@@ -1679,6 +1758,8 @@ def main(argv=None):
     img = sub.add_parser("image", help="export front view to PNG")
     img.add_argument("path")
     args = parser.parse_args(argv)
+    if args.timeout is not None:
+        os.environ["CAMCP_CALL_TIMEOUT"] = str(args.timeout)
     snapshot_file = getattr(args, "snapshot", None)
     args.snapshot_data = (
         json.loads(Path(snapshot_file).read_text(encoding="utf-8"))
@@ -1688,6 +1769,14 @@ def main(argv=None):
         asyncio.run(_main(args))
     except KeyboardInterrupt:
         return 130
+    except BaseException as exc:  # noqa: BLE001
+        timeout = find_timeout(exc)
+        if timeout is None:
+            raise
+        print(f"aborted: {timeout}", file=sys.stderr)
+        print("the session may already be wedged; run `chief_mcp.py settle` or restart Chief",
+              file=sys.stderr)
+        return 2
     return 0
 
 

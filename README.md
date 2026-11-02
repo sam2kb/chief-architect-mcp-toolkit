@@ -97,6 +97,14 @@ Set `CAMCP_TRACE=1` (and optionally `CAMCP_TRACE_FILE`) to append a line per MCP
 call to `~/.chief_mcp/trace.jsonl`. A hang shows up as a `call` with no matching
 `done`, which distinguishes "Chief is busy" from "the agent stopped talking".
 
+Every call runs under a watchdog (`CAMCP_CALL_TIMEOUT`, default 2 seconds; exports
+get 60). These tools do not fail fast — a dialog tool with no tracked dialog waits
+for one that never arrives — so overrunning the deadline aborts the call, closes
+the top-most modal, taps Escape, and raises `CallTimeout`. The CLI reports it and
+exits with status 2; `python chief_mcp.py --timeout 5 <command>` overrides the
+deadline, and `--timeout 0` disables it. After a trip the session may be wedged,
+so `settle` or a restart is the next step.
+
 Keyboard helpers, for the states MCP cannot reach. `send_key` and `send_escape`
 deliver Escape (cancel an in-place edit) and Tab (cycle the selection through
 stacked objects) — the only two keys allowed, with Delete and the edit commands
