@@ -137,5 +137,18 @@ class EnsureActiveTests(unittest.TestCase):
         self.assertEqual(state["reason"], "no Chief window found")
 
 
+class SendEscapeTests(unittest.TestCase):
+    def test_taps_escape_down_and_up(self):
+        lib = FakeUser32({})
+        self.assertTrue(chief_mcp.send_escape(lib=lib, presses=2, delay=0))
+        taps = [call for call in lib.calls if call[0] == "keybd_event"]
+        self.assertEqual(taps, [("keybd_event", chief_mcp.VK_ESCAPE)] * 4,
+                         "two presses, each a down and an up")
+
+    def test_without_a_windows_api_it_reports_failure(self):
+        with mock.patch.object(chief_mcp, "_user32", return_value=None):
+            self.assertFalse(chief_mcp.send_escape())
+
+
 if __name__ == "__main__":
     unittest.main()

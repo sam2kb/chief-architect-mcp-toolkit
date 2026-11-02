@@ -41,6 +41,15 @@ Geometry: `bbox`, `left`, `width`, `contains`, `free_point`, `fmt_inches`,
 Recipes, each of which opens a Specification dialog, writes the value, and
 confirms it: `open_spec`, `move_object`, `rename_room`, `set_text_fill`.
 These exist because the dialogs are the only edit path that reliably commits.
+They go through `spec_dialog`, a context manager that cancels the dialog if the
+body raises: a dialog left open holds the keyboard and refuses every later
+gesture, with no timeout.
+
+When one is already stuck, `recover()` fronts the window, cancels the tracked
+dialog, force-closes anything left on top, and reports whether a dialog is still
+open. `recover(keyboard=True)` also taps Escape, which clears an in-place text
+edit that has no dialog to inspect. `python chief_mcp.py recover --keyboard`
+does the same from a shell.
 
 Reading the model: `audit` checks the front view for unnamed rooms, zero-size
 objects, text on the wrong layer, locked layers, and exact duplicates.

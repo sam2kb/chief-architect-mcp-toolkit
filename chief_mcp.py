@@ -191,7 +191,7 @@ async def status(session):
 # --------------------------------------------------------------------------
 # window activation -- the manual "click into Chief" step, done for you
 # --------------------------------------------------------------------------
-VK_MENU, KEYEVENTF_KEYUP, SW_RESTORE = 0x12, 0x0002, 9
+VK_MENU, VK_ESCAPE, KEYEVENTF_KEYUP, SW_RESTORE = 0x12, 0x1B, 0x0002, 9
 CHIEF_TITLE = "Chief Architect Premier"
 
 
@@ -272,6 +272,54 @@ def ensure_active(title_part: str = CHIEF_TITLE, lib=None, attempts: int = 12,
         after = foreground_title(lib)
     return {"active": title_part.lower() in (after or "").lower(),
             "changed": True, "foreground": after}
+
+
+def send_escape(lib=None, presses: int = 1, delay: float = 0.08) -> bool:
+    """Press Escape in whatever window has the foreground.
+
+    Only Escape is exposed. Chief refuses Delete and other hotkeys over MCP on
+    purpose, and driving those through the keyboard would be a way around that
+    guardrail rather than a feature.
+    """
+    lib = lib or _user32()
+    if lib is None:
+        return False
+    for _ in range(max(presses, 1)):
+        lib.keybd_event(VK_ESCAPE, 0, 0, 0)
+        lib.keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(delay)
+    return True
+
+
+async def recover(session, keyboard: bool = False) -> dict:
+    """Get Chief back to a state that accepts gestures.
+
+    A dialog with a focused edit box holds the keyboard, and every gesture is
+    then refused until someone dismisses it -- nothing times out, so it waits
+    indefinitely. This fronts the window, cancels the agent-tracked dialog and
+    closes any untracked one left on top. ``keyboard`` also taps Escape, which
+    clears an in-place text edit, the state that has no dialog to inspect.
+    """
+    steps: dict = {"activation": ensure_active()}
+    steps["cancelled"] = await clear_dialogs(session)
+
+    dialogs = await call(session, "chief_discover_open_dialogs")
+    leftovers = (dialogs.get("dialogs") or []) + (dialogs.get("modelessDialogs") or [])
+    closed: list = []
+    for entry in leftovers:
+        title = entry.get("title")
+        try:
+            await call(session, "chief_force_close_dialog", title=title)
+            closed.append(title)
+        except Exception:  # noqa: BLE001
+            pass
+    steps["closed"] = closed
+
+    if keyboard:
+        steps["escape"] = send_escape()
+    still = await call(session, "chief_discover_open_dialogs")
+    steps["dialog_open"] = bool((still.get("trackedQuestion") or {}).get("active"))
+    return steps
 
 
 # --------------------------------------------------------------------------
@@ -519,54 +567,75 @@ async def open_spec(session, bounds, objects, skip_ids=(), expect=None, attempts
     raise RuntimeError(f"no matching dialog opened inside those bounds{suffix}")
 
 
+@asynccontextmanager
+async def spec_dialog(session, bounds, objects, skip_ids=(), expect=None, attempts=4):
+    """Open a Specification dialog and cancel it if the body raises.
+
+    A dialog with a focused edit box holds the keyboard: every gesture is then
+    refused, and nothing times out, so one abandoned dialog waits indefinitely
+    and costs the rest of the session. Using this instead of calling open_spec
+    directly means a crash mid-edit cleans up after itself.
+    """
+    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids,
+                             expect=expect, attempts=attempts)
+    try:
+        yield dialog
+    except BaseException:
+        await _cancel(session, dialog.get("questionId"))
+        raise
+
+
 async def move_object(session, bounds, objects, dx=0.0, dy=0.0, skip_ids=()):
     """Shift an object by (dx, dy) inches through its position fields.
 
     Works on objects whose Specification dialog exposes ``boxID_XPos`` /
     ``boxID_YPos`` on the General panel (CAD blocks, text, and similar).
     """
-    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
-    question = dialog.get("questionId")
-    fields = await dialog_fields(session, panel="General")
-    x_node = find_node(fields, "boxID_XPos")
-    y_node = find_node(fields, "boxID_YPos")
-    if x_node is None or y_node is None:
-        await press(session, "1", "Cancel", question)
-        raise RuntimeError("that dialog has no X/Y position fields")
+    async with spec_dialog(session, bounds, objects, skip_ids=skip_ids) as dialog:
+        question = dialog.get("questionId")
+        fields = await dialog_fields(session, panel="General")
+        x_node = find_node(fields, "boxID_XPos")
+        y_node = find_node(fields, "boxID_YPos")
+        if x_node is None or y_node is None:
+            raise RuntimeError("that dialog has no X/Y position fields")
 
-    if dx:
-        await set_field(session, "boxID_XPos",
-                        value=f'{parse_inches(x_node["value"]) + dx}"', question=question)
-    if dy:
-        await set_field(session, "boxID_YPos",
-                        value=f'{parse_inches(y_node["value"]) + dy}"', question=question)
-    await press(session, "0", "OK", question)
+        if dx:
+            await set_field(session, "boxID_XPos",
+                            value=f'{parse_inches(x_node["value"]) + dx}"', question=question)
+        if dy:
+            await set_field(session, "boxID_YPos",
+                            value=f'{parse_inches(y_node["value"]) + dy}"', question=question)
+        await press(session, "0", "OK", question)
 
 
 async def rename_room(session, bounds, objects, name, skip_ids=()):
     """Set a room's name, which is what its plan label displays."""
-    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
-    question = dialog.get("questionId")
-    fields = await dialog_fields(session, panel="General")
-    if find_node(fields, "roomID_RoomName") is None:
-        await press(session, "1", "Cancel", question)
-        raise RuntimeError("that dialog has no room name field")
-    await set_field(session, "roomID_RoomName", value=name, question=question)
-    await press(session, "0", "OK", question)
+    async with spec_dialog(session, bounds, objects, skip_ids=skip_ids) as dialog:
+        question = dialog.get("questionId")
+        fields = await dialog_fields(session, panel="General")
+        if find_node(fields, "roomID_RoomName") is None:
+            raise RuntimeError("that dialog has no room name field")
+        await set_field(session, "roomID_RoomName", value=name, question=question)
+        await press(session, "0", "OK", question)
 
 
 async def set_text_fill(session, bounds, objects, hex_color, skip_ids=()):
     """Set the fill/background of a text object, e.g. '#FFFF00' for yellow."""
-    dialog = await open_spec(session, bounds, objects, skip_ids=skip_ids)
-    question = dialog.get("questionId")
-    await dialog_fields(session, panel="Fill Style")
+    async with spec_dialog(session, bounds, objects, skip_ids=skip_ids) as dialog:
+        question = dialog.get("questionId")
+        await dialog_fields(session, panel="Fill Style")
 
-    await set_field(session, "attrID_PatternColor", value=True, question=question)
-    colour = await dialog_fields(session)
-    colour_question = colour.get("questionId")
-    await set_field(session, "ColorShower_Hex", value=hex_color, question=colour_question)
-    await press(session, "0", "OK", colour_question)
-    await press(session, "0", "OK", question)
+        await set_field(session, "attrID_PatternColor", value=True, question=question)
+        colour = await dialog_fields(session)
+        colour_question = colour.get("questionId")
+        try:
+            await set_field(session, "ColorShower_Hex", value=hex_color,
+                            question=colour_question)
+            await press(session, "0", "OK", colour_question)
+        except BaseException:
+            await _cancel(session, colour_question)
+            raise
+        await press(session, "0", "OK", question)
 
 
 # --------------------------------------------------------------------------
@@ -1111,6 +1180,14 @@ async def _main(args):
             print(f"foreground before : {before!r}")
             print(f"foreground after  : {state.get('foreground')!r}")
             print(f"active={state.get('active')} changed={state.get('changed')}")
+        elif args.cmd == "recover":
+            steps = await recover(s, keyboard=args.keyboard)
+            print(f"foreground  : {steps['activation'].get('foreground')!r}")
+            print(f"cancelled   : {steps['cancelled']!r}")
+            print(f"force-closed: {steps['closed']}")
+            if args.keyboard:
+                print(f"escape sent : {steps.get('escape')}")
+            print(f"dialog open : {steps['dialog_open']}")
         elif args.cmd == "views":
             for v in await views(s):
                 front = "*" if v.get("front") else " "
@@ -1166,6 +1243,9 @@ def main(argv=None):
     difference.add_argument("--out")
     bulk.add_argument("--apply", action="store_true", help="write for real; default is a plan only")
     sub.add_parser("active", help="bring Chief to the front and report the foreground window")
+    rec = sub.add_parser("recover", help="clear a dialog or text edit that is holding the keyboard")
+    rec.add_argument("--keyboard", action="store_true",
+                     help="also tap Escape, for an in-place text edit with no dialog")
     sub.add_parser("views", help="open views")
     doc = sub.add_parser("docs", help="search Chief's help")
     doc.add_argument("query")

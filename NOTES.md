@@ -38,8 +38,8 @@ server, which needs a Google API key and is not registered by default.
 
 ## Recipes that work
 
-0. **Before anything else** — `snapshot` the front view and run `clear_dialogs`.
-   Keep the snapshot file so a `diff` afterwards can prove what changed. A modal
+0. **Before anything else** — `recover()` the app, then `snapshot` the front view.
+   Keep the snapshot file so a `diff` afterwards can prove what changed. A dialog
    left open refuses every later gesture, and the refusal looks exactly like a
    click that missed.
 1. **Edit an object's numeric properties** — `doubleClick` a free point on the
@@ -63,6 +63,16 @@ server, which needs a Google API key and is not registered by default.
 
 ## Pitfalls
 
+- **A focused edit box holds Chief hostage, indefinitely.** Open a Specification
+  dialog, leave the cursor in a field, and every gesture comes back
+  `success: false` with "Chief is showing an agent-tracked modal dialog".
+  Nothing times out; it waits for a decision that never comes. Reproduced on
+  demand: open a dialog, gesture refused, `recover()`, gesture works again.
+  `spec_dialog()` exists so the recipes cancel their own dialog when the body
+  raises, and `recover()` is the manual fix -- including `--keyboard`, which taps
+  Escape for an in-place text edit, the case with no dialog to inspect. Escape
+  is the only key exposed: Delete and the other hotkeys are refused over MCP by
+  design, and driving them through Win32 would be a way around that, not a fix.
 - **Gestures are not blocked by a background window, but activation is blocked
   until ALT is tapped.** Measured here: the same double-click opened its dialog
   with Chief covered by another app, minimized, and in front; a 9-door
